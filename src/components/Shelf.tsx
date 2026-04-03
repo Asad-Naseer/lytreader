@@ -11,7 +11,7 @@ function Shelf({ books, onOpenBook  }: shelfProps) {
         <div className="flex flex-wrap">
         {books.map((book, index) => (       // basically dudeman, .map loops thru an array and returns a new array.
           <div key={index} className="w-32 m-0 p-1 pointer lg:w-48" onClick={() => {onOpenBook(book); console.log("book clicked")}}>
-            <img src={book.cover} alt="cover" className="br3" />
+            <img src={book.cover} alt='cover' className="br3" />
           </div>
         ))}
       </div>
