@@ -1,0 +1,11 @@
+/* This file is imported in your index.js (or main.jsx), which is the entry point of your entire application. Because it is imported at the top level, these styles apply to the entire application. */
+
+body {
+  margin: 0;
+  font-family: 'Arial', sans-serif; /* Applies to every element */
+  background-color: #f5efe9;
+}
+.navBorderColor { border-color: #97928d; }
+
+
+@import "tailwindcss";
