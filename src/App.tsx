@@ -31,7 +31,7 @@ function App() {
         const bookKeys = keys.filter(key => key.startsWith('book-'));
 
         // fetch all books that are in indexedDB
-        const savedBooks = await Promise.all(
+        const savedBooks = await Promise.all(   // we need to use Promise.all here because localforage returns a promise for each key. React state expects real data not promises. Promise.all waits until all promises are resolved.
           bookKeys.map(key => localforage.getItem<Book>(key))
         );
 
