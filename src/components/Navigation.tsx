@@ -1,4 +1,3 @@
-
 import ePub from 'epubjs';
 import localforage from 'localforage';
 import type {Book} from '../App.tsx';
