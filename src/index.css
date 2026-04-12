@@ -3,7 +3,8 @@
 body {
   margin: 0;
   font-family: 'Arial', sans-serif; /* Applies to every element */
-  background-color: #f5efe9;
+  background-color: #1c1c1c;
+  color: white;
 }
 .navBorderColor { border-color: #97928d; }
 
