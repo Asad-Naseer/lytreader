@@ -7,6 +7,13 @@ interface shelfProps {
 }
 
 function Shelf({ books, onOpenBook  }: shelfProps) {
+    if (books.length === 0 ) {
+      return (
+      <div className="w-screen h-screen flex items-center justify-center text-gray">
+        No Books Imported
+      </div>)
+    }
+
     return (
         <div className="flex flex-wrap">
         {books.map((book, index) => (       // basically dudeman, .map loops thru an array and returns a new array.
