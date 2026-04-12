@@ -8,6 +8,13 @@ interface readerProps {
     onClose: () => void
 }
 
+interface tocItem {
+    id: string,
+    href: string,
+    label: string,
+    subitems?: tocItem[]
+}
+
 export default function Reader({bookData, onClose}: readerProps) {
 
     // define a ref html div element to pass to epubjs so it can render the book into it
@@ -19,7 +26,27 @@ export default function Reader({bookData, onClose}: readerProps) {
     const [pageInfo, setPageInfo] = useState<string>("Calculating")
 
     // define a state to control the visibility of the header
-    const [showHeader, setShowHeader] = useState<boolean>(false);
+    const [showHeaderFooter, setShowHeaderFooter] = useState<boolean>(false);
+
+    // Sidebar and TOC states
+    const [showSidebar, setShowSidebar] = useState<boolean>(false);
+    const [sidebarTab, setSidebarTab] = useState<'toc' | 'highlights'>('toc');
+    const [toc, setToc] = useState<tocItem[]>([]);
+
+    // Fontsize states
+    const [fontSize, setFontSize] = useState<number>(100) // percentage
+    const [showFontMenu, setShowFontMenu] = useState<boolean>(false);
+
+    // 1. Load saved font size on initial mount 
+    useEffect(() => {
+        const loadSavedSettings = async () => {
+            const savedFontSize = await localforage.getItem<number>('reader-font-size');
+            if (savedFontSize) {
+                setFontSize(savedFontSize);
+            }
+        };
+        loadSavedSettings();
+    }, []);
 
     // Use useEffect to make sure book is loaded then check if both viewerRef and bookData.data are present.
     // Setup new rendition, generate page locations and update state whenever rendition is "relocated" (page changes)
@@ -41,8 +68,14 @@ export default function Reader({bookData, onClose}: readerProps) {
             "body": {
                 "-webkit-user-select": "none",
                 "user-select": "none",
-                "-webkit-touch-callout": "none" // Disables the iOS/Android popup menu
+                "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
+                "color": "white"
             }
+        });
+
+        // Get TOC from epubjs
+        book.loaded.navigation.then((nav:any) => {
+            setToc(nav.toc);
         });
 
         // actually display the rendition and check for stored book positions
@@ -93,6 +126,16 @@ export default function Reader({bookData, onClose}: readerProps) {
     }, [bookData]);
 
 
+    // Apply and Saved Fontsize whenever it changes
+    useEffect(() => {
+        if (rendition) {
+            rendition.themes.fontSize(`${fontSize}%`);
+            // Save globally to persist accross book reloads
+            localforage.setItem('reader-font-size', fontSize);
+        }
+    }, [fontSize, rendition]);
+
+
     // SETTING UP NAVIGATION USING keyboard, clicks and swipes
     // use useEffect to check if rendition state is live before setting up navigation controls.
 
@@ -130,7 +173,7 @@ export default function Reader({bookData, onClose}: readerProps) {
             } else if (clickX > viewerWidth * 0.7) {
                 rendition.next();
             } else {
-                setShowHeader((prev) => !prev);  // set showHeader to flase if true and true if flase
+                setShowHeaderFooter((prev) => !prev);  // set showHeader to flase if true and true if flase
             }
         }
 
@@ -179,32 +222,144 @@ export default function Reader({bookData, onClose}: readerProps) {
     }, [rendition]);
 
 
+    // Render TOC function
+    const renderToc = (items: tocItem[], level = 0) => {
+        return items.map((item, index) => (
+            <div key={item.id || index}>
+                <button
+                    className="text-left w-full py-3 px-4 border-b"
+                    style={{ paddingLeft: `${(level * 1.5) + 1}rem` }} // if level is non zero meaning subitems are being rendered, this will add some padding to them
+                    onClick={() => {
+                        rendition.display(item.href);
+                        setShowSidebar(false);
+                        setShowHeaderFooter(false);
+                    }}
+                >
+                    {item.label}
+                </button>
+                {item.subitems && item.subitems.length > 0 && renderToc(item.subitems, level + 1)}
+            </div>
+        ));
+    };
+
+
     // WHAT THE READER ACTUALLY RENDERS:
 
     return (
-        <div className='flex flex-col absolute w-full h-full top-0'> {/* The parent div needs to have a defined w and h because epubjs requires this for the div it renders the book into */}
-            {/* Conditionally rendered Header */}
-            {
+        <div className='flex flex-col absolute w-full h-full top-0 overflow-hidden'> 
 
-                showHeader && (
-                    <div className='flex justify-start items-center'>
-                        <button onClick={onClose} className='bg-[#e24741] rounded text-white p-1 mt-1 pointer'>Close</button>
+            {/* TOP BAR */}
+            {showHeaderFooter && (
+                <div className='absolute bg-[#1c1c1c] top-0 left-0 w-full z-10 flex justify-between items-center p-3 shadow-md'>
+                    <button 
+                        onClick={() => {
+                            setShowSidebar(true);
+                            setShowHeaderFooter(false); 
+                        }} 
+                        className='rounded px-4 py-2 pointer font-medium'>
+                        ☰ Menu
+                    </button>
+                    
+                    <button 
+                        onClick={onClose} 
+                        className='bg-[#e24741] hover:bg-red-600 rounded text-white px-4 py-2 pointer transition-colors font-medium'>
+                        Close
+                    </button>
+                </div>
+            )}
+
+            {/* SIDEBAR OVERLAY */}
+            {showSidebar && (
+                <div className="absolute inset-0 z-20 flex">
+                    <div className="w-4/5 max-w-sm h-full bg-[#1c1c1c] flex flex-col">
+                        <div className="flex border-b text-center">
+                            <button 
+                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'toc' ? 'border-b-4 ' : 'text-gray-500'}`}
+                                onClick={() => setSidebarTab('toc')}
+                            >
+                                Chapters
+                            </button>
+                            <button 
+                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'highlights' ? 'border-b-4 ' : 'text-gray-500'}`}
+                                onClick={() => setSidebarTab('highlights')}
+                            >
+                                Highlights
+                            </button>
+                        </div>
+
+                        <div className="flex-1 overflow-y-auto">
+                            {sidebarTab === 'toc' && (
+                                <div className="flex flex-col">
+                                    {toc.length > 0 ? renderToc(toc) : <p className="p-4">No Table of Contents found.</p>}
+                                </div>
+                            )}
+                            {sidebarTab === 'highlights' && (
+                                <div className="p-4 text-center mt-10">
+                                    Highlights coming soon.
+                                </div>
+                            )}
+                        </div>
                     </div>
-                )   
-               
-            }
+                    
+                    <div 
+                        className="flex-1 bg-black/50" 
+                        onClick={() => setShowSidebar(false)}
+                    ></div>
+                </div>
+            )}
 
-            {/* The viewer */}
 
-            <div ref={viewerRef} className='flex-1 overflow-hidden'></div>
+            {/* THE VIEWER */}
+            <div ref={viewerRef} className='flex-1 overflow-hidden relative z-0'></div>
 
-            {/* Footer with page numbers */}
-            <div className='p-0 justify-center flex'>
-                Page {pageInfo}
+
+            {!showHeaderFooter && !showSidebar && (
+                <div className="absolute bottom-0 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+                    <p className="text-[10px] uppercase tracking-widest text-white/40 font-semibold">
+                        {pageInfo}
+                    </p>
+                </div>
+            )}
+
+
+
+            {/* FOOTER */}
+            {/* FOOTER - Now conditional */}
+        {showHeaderFooter && (
+            <div className='p-1 flex items-center justify-between border-t relative z-10 bg-[#1c1c1c]'>
+                
+                <div className="relative w-1/3 pl-4">
+                    <button 
+                        onClick={() => setShowFontMenu(!showFontMenu)} 
+                        className="ml-4 p-2 rounded font-bold w-10 h-10 flex items-center justify-center">
+                        Aa
+                    </button>
+                    
+                    {showFontMenu && (
+                        <div className="absolute bottom-full left-0 mb-3 bg-[#1c1c1c] p-2 rounded shadow-lg border flex items-center gap-3">
+                            <button 
+                                onClick={() => setFontSize(f => Math.max(50, f - 10))} 
+                                className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center">
+                                -
+                            </button>
+                            <span className="w-12 text-center font-medium">{fontSize}%</span>
+                            <button 
+                                onClick={() => setFontSize(f => Math.min(300, f + 10))} 
+                                className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center">
+                                +
+                            </button>
+                        </div>
+                    )}
+                </div>
+
+                <div className='text-center'>
+                    Page {pageInfo}
+                </div>
+
+                <div className="w-1/3"></div>
             </div>
-
-
-        </div>
+        )}
+    </div>
     )
 
 
