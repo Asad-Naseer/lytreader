@@ -60,8 +60,9 @@ export default function Reader({bookData, onClose}: readerProps) {
         const newRendition = book.renderTo(viewerRef.current, {
             width: "100%",
             height: "100%",
-            spread: "none"
-        })
+            minSpreadWidth: 1000,
+            gap: 40
+        }as any)
 
         // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
         newRendition.themes.default({
@@ -69,9 +70,10 @@ export default function Reader({bookData, onClose}: readerProps) {
                 "-webkit-user-select": "none",
                 "user-select": "none",
                 "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
-                "color": "white"
+                "color": "#c2c2c2"
             }
         });
+
 
         // Get TOC from epubjs
         book.loaded.navigation.then((nav:any) => {
