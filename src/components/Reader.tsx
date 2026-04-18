@@ -18,10 +18,25 @@ interface tocItem {
 export default function Reader({bookData, onClose}: readerProps) {
 
     // define a ref html div element to pass to epubjs so it can render the book into it
-
     const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
 
-    // define rendition and pageInfo states for epubjs
+    // define timeout var using a react hook (used for highlights)
+    const selectionTimeout = useRef<NodeJS.Timeout | null>(null);
+
+    // define pending highlight var to check for when highlights start and deciding when to finalize them
+    const pendingHighlight = useRef<{cfi: string, contents: any} | null>(null)
+
+    // define bookHighlightsKey for loading book highlights
+    const bookHighlightsKey = `highlights-${bookData.id}`;
+
+    // define list state for highlights
+    const [highlightsList, setHighlightsList] = useState<{cfi: string, text: string}[]>([]);
+
+    // define deleteMenu state for deleting highlights. this will use x,y values to determine where it should appear.
+    const [deleteMenu, setDeleteMenu] = useState<{cfi: string} | null>(null)
+
+    // define rendition and pageInfo states for epubjs and book state
+    const [book, setBook] = useState<any>(null);
     const [rendition, setRendition] = useState<any>(null)
     const [pageInfo, setPageInfo] = useState<string>("Calculating")
 
@@ -56,8 +71,9 @@ export default function Reader({bookData, onClose}: readerProps) {
         if(!viewerRef.current || !bookData.data) return; // stop execution if either are false/missing
 
         // initialize book using the data and epubjs and create and display rendition
-        const book = ePub(bookData.data);
-        const newRendition = book.renderTo(viewerRef.current, {
+        const newBook = ePub(bookData.data);
+        setBook(newBook);
+        const newRendition = newBook.renderTo(viewerRef.current, {
             width: "100%",
             height: "100%",
             minSpreadWidth: 1000,
@@ -67,16 +83,24 @@ export default function Reader({bookData, onClose}: readerProps) {
         // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
         newRendition.themes.default({
             "body": {
-                "-webkit-user-select": "none",
-                "user-select": "none",
+                // "-webkit-user-select": "none",
+                // "user-select": "none",
                 "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
                 "color": "#c2c2c2"
+            },
+            "::selection": {
+                "background": "rgba(225,225,0,0.3)"
+            },
+            ".epubjs-hl": {
+                "fill": "yellow",
+                "fill-opacity": "0.3",
+                // "mix-blend-mode": "multiply"
             }
         });
 
 
         // Get TOC from epubjs
-        book.loaded.navigation.then((nav:any) => {
+        newBook.loaded.navigation.then((nav:any) => {
             setToc(nav.toc);
         });
 
@@ -95,9 +119,9 @@ export default function Reader({bookData, onClose}: readerProps) {
 
         // now calculate and update pageInfo state (page numbers)
 
-        book.ready.then(() => {
-            return book.locations.generate(1024); // 1024 characters define a location chunk, which epub.js uses to approximate pages.
-        }).then((_locations) => {
+        newBook.ready.then(() => {
+            return newBook.locations.generate(1024); // 1024 characters define a location chunk, which epub.js uses to approximate pages.
+        }).then((_locations: any) => {
             const currentLocation = newRendition.currentLocation() as any; // this will be used only once to show the locations
 
             if (currentLocation) {
@@ -121,7 +145,7 @@ export default function Reader({bookData, onClose}: readerProps) {
 
         // run cleaup func to destroy the book when component unmounts
         return () => {
-            book.destroy();
+            newBook.destroy();
         };
 
 
@@ -165,14 +189,26 @@ export default function Reader({bookData, onClose}: readerProps) {
          only go forward. For this reason we need to calculate the modulo of the click co-ordinate relative to the viewer width. */
 
         const handleClick = (e: any) => {
+
+            // if a pending highlight is detected, finalize it immediately.
+            if (pendingHighlight.current) {
+                const { cfi, contents } = pendingHighlight.current;
+                finalizeHighlight(cfi, contents)
+                return;
+            }
+
+            // disappear delete and font menu when user clicks somewhere that is not the delete button
+            setDeleteMenu(null);
+            setShowFontMenu(false);
+
             // get the width of the viewer
             const viewerWidth = viewerRef.current ? viewerRef.current.clientWidth : window.innerWidth;
 
             const clickX = e.clientX % viewerWidth;
             
-            if (clickX < viewerWidth * 0.3) {
+            if (clickX < viewerWidth * 0.01) {
                 rendition.prev();
-            } else if (clickX > viewerWidth * 0.7) {
+            } else if (clickX > viewerWidth * 0.99) {
                 rendition.next();
             } else {
                 setShowHeaderFooter((prev) => !prev);  // set showHeader to flase if true and true if flase
@@ -223,6 +259,182 @@ export default function Reader({bookData, onClose}: readerProps) {
 
     }, [rendition]);
 
+    
+    // make finalizeHighlight function to call automatically after 5 seconds of inactivity after highlighting something
+    const finalizeHighlight = async (cfiRange: string, contents:any) => {
+
+        if(!rendition || !book) return;
+
+        // reset selection timer if running
+        if (selectionTimeout.current) {
+            clearTimeout(selectionTimeout.current);
+            selectionTimeout.current = null;
+        }
+
+        // only proceed if the highlight has not been finalized yet.
+        if (!pendingHighlight.current) return;
+        
+        // clear the pendinghighlight (we already have the cfi and contents from it)
+        pendingHighlight.current = null;
+
+        // apply to ui
+        rendition.annotations.add('highlight', cfiRange, {}, (e: MouseEvent) => {
+            setDeleteMenu({cfi: cfiRange});
+            console.log("Clicked Highlight:", cfiRange, e, contents)
+        })
+
+        // save to localforage
+        const range = await book.getRange(cfiRange);
+        const text = range.toString();
+        const existingHighlights: {cfi: string, text: string}[] = await localforage.getItem(bookHighlightsKey) || [];
+
+        if (!existingHighlights.find(h => h.cfi === cfiRange)) {
+            existingHighlights.push({ cfi: cfiRange, text: text });
+            await localforage.setItem(bookHighlightsKey, existingHighlights);
+        }
+
+
+    }
+
+
+    // Applying and saving highlights.
+    useEffect(() => {
+        if (!rendition || !book) return;
+        const handleSelected = (cfiRange: string, contents: any) => {
+                // keep killing the timer if user is still dragging, starting the timer anew
+                if (selectionTimeout.current) {
+                    clearTimeout(selectionTimeout.current);
+                }
+
+                // mark the cfi and contents passed to this as pending highlight
+                pendingHighlight.current = {cfi: cfiRange, contents}
+
+                // Wait for 5000ms (5s) before auto finalizing the highlight.
+                selectionTimeout.current = setTimeout(() => {
+                    finalizeHighlight(cfiRange, contents);
+ 
+            }, 5000)
+
+        };
+
+        rendition.on("selected", handleSelected);
+
+        // cleanup when component dismounts
+        return () => {
+            rendition.off("selected", handleSelected);
+        };
+    }, [rendition, book])
+
+    
+
+    // Apply saved highlights
+    useEffect(() => {
+
+        if (!rendition) return;
+
+        const applySavedHighlights = async () => {
+            
+            // get array of CFIs and Texts from storage
+            const savedHighlights: {cfi: string, text: string}[] = await localforage.getItem(bookHighlightsKey) || [];
+
+            // loop through the highlights and apply them
+            savedHighlights.forEach(hl => {
+
+                // remove it if it already exists because render keeps drawing it again whever the chapter loads, this only removes the visual highlight
+                rendition.annotations.remove(hl.cfi, 'highlight');
+
+                rendition.annotations.add('highlight', hl.cfi, {}, (e:MouseEvent) => {
+
+                    // give deleteMenu state the x and y position of where user clicked and the cfi to delete.
+                    setDeleteMenu({
+                        cfi: hl.cfi
+                    });
+
+                    console.log("clicked highlight: ", hl.cfi, e)
+                });
+            });
+
+            console.log(`Applied ${savedHighlights.length} highlights`);
+        }
+
+        rendition.on('rendered', applySavedHighlights);
+
+        // clean up 
+
+        return () => {
+            rendition.off('rendered', applySavedHighlights);
+        };
+
+
+    }, [rendition, bookData.id])
+    
+    
+    // function for removing highlights
+    const handleRemoveHighlight = async (cfi: string) => {
+        if (!rendition) return;
+        
+        // remove highlight from ui
+        rendition.annotations.remove(cfi, 'highlight');
+
+        // remove from localforage 
+        const existingHighlights: {cfi: string, text: string}[] = await localforage.getItem(bookHighlightsKey) || [];
+        const updatedHighlights = existingHighlights.filter(h => h.cfi !== cfi);
+        await localforage.setItem(bookHighlightsKey, updatedHighlights);
+
+        // close the menu
+        setDeleteMenu(null);
+    }
+
+
+
+    // fetch highlights data whenever sidebar opens
+    useEffect(() => {
+        if (showSidebar && sidebarTab === 'highlights') {
+            const load = async () => {
+                const data = await localforage.getItem<{cfi: string, text: string}[]>(bookHighlightsKey);
+
+                if (data) {
+                    //sort descending compare b to a 
+                    // numeric true handles numbers inside strings better
+                    const sortedData = [...data].sort((a,b) => 
+                        b.cfi.localeCompare(a.cfi, undefined, {numeric: true, sensitivity: 'base'})
+                    );
+                    setHighlightsList(sortedData);
+                } else {
+                    setHighlightsList([]);
+                }
+            }
+            load();
+        }
+    }, [showSidebar, sidebarTab, bookHighlightsKey])
+
+
+    // Render Highlights function
+    const renderHighlights = () => {
+        if (highlightsList.length === 0) {
+            return <p className="p-4 text-center text-gray-500">No highlights yet.</p>;
+        }
+
+        return highlightsList.map((item, index) => {
+            return (
+                <button
+            key={item.cfi || index}
+            className='text-left w-full py-3 px-4 border-b'
+            onClick={() => {
+                rendition.display(item.cfi);
+                setShowSidebar(false);
+            }}
+            >
+
+                <p className="text-sm italic line-clamp-3 leading-relaxed">
+                    "{item.text}"
+                </p>
+                
+            </button>
+            )
+        })
+    }
+
 
     // Render TOC function
     const renderToc = (items: tocItem[], level = 0) => {
@@ -258,13 +470,22 @@ export default function Reader({bookData, onClose}: readerProps) {
                             setShowSidebar(true);
                             setShowHeaderFooter(false); 
                         }} 
-                        className='rounded px-4 py-2 pointer font-medium'>
+                        className='rounded py-2 pointer font-medium'>
                         ☰ Menu
                     </button>
-                    
+
+                    {deleteMenu && (
+                        <button
+                        onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
+                        className='bg-[#e24741] hover:bg-red-700 py-1.5 px-3 rounded transition-colors text-sm'
+                        >
+                            Delete Highlight
+                        </button>
+                    )}
+
                     <button 
                         onClick={onClose} 
-                        className='bg-[#e24741] hover:bg-red-600 rounded text-white px-4 py-2 pointer transition-colors font-medium'>
+                        className='bg-[#e24741] hover:bg-red-600 rounded px-4 py-2 pointer transition-colors font-medium'>
                         Close
                     </button>
                 </div>
@@ -296,8 +517,8 @@ export default function Reader({bookData, onClose}: readerProps) {
                                 </div>
                             )}
                             {sidebarTab === 'highlights' && (
-                                <div className="p-4 text-center mt-10">
-                                    Highlights coming soon.
+                                <div className="flex flex-col">
+                                    {renderHighlights()}
                                 </div>
                             )}
                         </div>
@@ -309,7 +530,6 @@ export default function Reader({bookData, onClose}: readerProps) {
                     ></div>
                 </div>
             )}
-
 
             {/* THE VIEWER */}
             <div ref={viewerRef} className='flex-1 overflow-hidden relative z-0'></div>
