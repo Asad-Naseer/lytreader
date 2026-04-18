@@ -20,9 +20,6 @@ export default function Reader({bookData, onClose}: readerProps) {
     // define a ref html div element to pass to epubjs so it can render the book into it
     const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
 
-    // define timeout var using a react hook (used for highlights)
-    const selectionTimeout = useRef<NodeJS.Timeout | null>(null);
-
     // define pending highlight var to check for when highlights start and deciding when to finalize them
     const pendingHighlight = useRef<{cfi: string, contents: any} | null>(null)
 
@@ -263,13 +260,7 @@ export default function Reader({bookData, onClose}: readerProps) {
     // make finalizeHighlight function to call automatically after 5 seconds of inactivity after highlighting something
     const finalizeHighlight = async (cfiRange: string, contents:any) => {
 
-        if(!rendition || !book) return;
-
-        // reset selection timer if running
-        if (selectionTimeout.current) {
-            clearTimeout(selectionTimeout.current);
-            selectionTimeout.current = null;
-        }
+        if(!rendition || !book || !pendingHighlight.current) return;
 
         // only proceed if the highlight has not been finalized yet.
         if (!pendingHighlight.current) return;
@@ -277,7 +268,8 @@ export default function Reader({bookData, onClose}: readerProps) {
         // clear the pendinghighlight (we already have the cfi and contents from it)
         pendingHighlight.current = null;
 
-        // apply to ui
+        // apply to ui , remove first to make sure no duplicates
+        rendition.annotations.remove(cfiRange, "highlight");
         rendition.annotations.add('highlight', cfiRange, {}, (e: MouseEvent) => {
             setDeleteMenu({cfi: cfiRange});
             console.log("Clicked Highlight:", cfiRange, e, contents)
@@ -301,19 +293,9 @@ export default function Reader({bookData, onClose}: readerProps) {
     useEffect(() => {
         if (!rendition || !book) return;
         const handleSelected = (cfiRange: string, contents: any) => {
-                // keep killing the timer if user is still dragging, starting the timer anew
-                if (selectionTimeout.current) {
-                    clearTimeout(selectionTimeout.current);
-                }
 
-                // mark the cfi and contents passed to this as pending highlight
+                // mark the cfi and contents passed to handleSelected as pending highlight
                 pendingHighlight.current = {cfi: cfiRange, contents}
-
-                // Wait for 5000ms (5s) before auto finalizing the highlight.
-                selectionTimeout.current = setTimeout(() => {
-                    finalizeHighlight(cfiRange, contents);
- 
-            }, 5000)
 
         };
 
