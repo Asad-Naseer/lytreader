@@ -88,6 +88,24 @@ export default function Reader({bookData, onClose}: readerProps) {
             flow: "scrolled",
         }as any)
 
+
+        // disable chrome opening context menu on every click
+        newRendition.hooks.content.register((contents: any) => {
+            const doc = contents.document;
+            const body = doc.body;
+
+            if (body) {
+                // Setting tabindex to -1 tricks Chrome into thinking the body is an interactive 
+                // element, which completely disables the "Touch to Search" / Google Search popup.
+                body.setAttribute('tabindex', '-1');
+            }
+
+            // Prevent the default OS context menu (copy/paste/share) from appearing on long press
+            doc.addEventListener('contextmenu', (e: Event) => {
+                e.preventDefault();
+            });
+        });
+
         // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
         newRendition.themes.default({
             "body": {
@@ -108,6 +126,9 @@ export default function Reader({bookData, onClose}: readerProps) {
                 // "mix-blend-mode": "multiply"
             }
         });
+
+
+        
 
 
         // Get TOC from epubjs
@@ -256,9 +277,9 @@ export default function Reader({bookData, onClose}: readerProps) {
             touchEndX = e.changedTouches[0].screenX;
 
             const swipeDistance = touchStartX - touchEndX;
-            if (swipeDistance > 100) { 
+            if (swipeDistance > 200) { 
                 rendition.next(); // user swiped from right to left
-            } else if (swipeDistance < -100) {
+            } else if (swipeDistance < -200) {
                 rendition.prev(); // user swiped from left to right
             }
         };
@@ -651,7 +672,7 @@ export default function Reader({bookData, onClose}: readerProps) {
                     <div className="relative w-1/3 pl-4">
                         <button
                             onClick={() => setShowFontMenu(!showFontMenu)}
-                            className="ml-4 p-2 rounded font-bold w-10 h-10 flex items-center justify-center">
+                            className="ml-4 rounded font-bold px-4 py-2 flex items-center justify-center ">
                             Aa
                         </button>
 
@@ -672,12 +693,30 @@ export default function Reader({bookData, onClose}: readerProps) {
                         )}
                     </div>
 
-                    <div className='text-center'>
-                        Page {pageInfo}
-                    </div>
+                    {/* Center Side: Navigation and Page Info */}
+        <div className='flex items-center gap-6'>
+            <button 
+                onClick={() => rendition?.prev()}
+                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 hover:bg-white/40 active:bg-white/70"
+            >
+                ‹
+            </button>
+            
+            <div className='text-center text-[11px] flex uppercase whitespace-nowrap text-gray-400 font-medium'>
+                {pageInfo}
+            </div>
 
-                    <div className="w-1/3"></div>
-                </div>
+            <button 
+                onClick={() => rendition?.next()}
+                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 hover:bg-white/40 active:bg-white/70"
+            >
+                ›
+            </button>
+        </div>
+
+        {/* Right Side: Spacer to keep center balanced */}
+        <div className="w-1/3"></div>
+    </div>
             )}
         </div>
 
