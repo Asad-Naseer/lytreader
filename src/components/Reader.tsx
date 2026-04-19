@@ -26,12 +26,6 @@ export default function Reader({bookData, onClose}: readerProps) {
     // define selection text for dictionary lookup
     const [selectionText, setSelectionText] = useState<string>("");
 
-    // define dictionary data states for response received from the api
-    const [dictionaryData, setDictionaryData] = useState<any>(null);
-
-    // define dictionary loading state to for meaning card
-    const [isDictionaryLoading, setIsDictionaryLoading] = useState(false);
-
     // define bookHighlightsKey for loading book highlights
     const bookHighlightsKey = `highlights-${bookData.id}`;
 
@@ -89,7 +83,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         }as any)
 
 
-        // disable chrome opening context menu on every click
+        // disable chrome opening context menu on every click;
         newRendition.hooks.content.register((contents: any) => {
             const doc = contents.document;
             const body = doc.body;
@@ -500,28 +494,21 @@ export default function Reader({bookData, onClose}: readerProps) {
     };
 
 
-    // func for using dictionary api
-    const handleDictionaryLookup = async () => {
+    // func for opening a Google search in a new tab [study this]
+    const handleDictionaryLookup = () => {
         if (!selectionText) return;
 
-        setIsDictionaryLoading(true)
+        // selects the first word and removes the punctuation from it
+        const word = selectionText.split(/\s+/)[0].replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g,""); 
+        
+        // create the google search url
+        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(word + ' meaning')}`;
+        
+        // open in a new tab securely
+        window.open(searchUrl, '_blank', 'noopener,noreferrer');
 
-        try {
-            const word = selectionText.split(/\s+/)[0].replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g,""); // selects the first word and removes the punctuation from it
-            const response = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${word}`)
-            const data = await response.json();
-
-            if (Array.isArray(data)) {
-                setDictionaryData(data[0])
-            } else {
-                setDictionaryData({ word, message: "No Definition Found."}) // message is one of the elements of the object of the array that the api sends us back, by using message here we can display our own.
-            }
-
-        } catch (error) {
-            setDictionaryData({ word: selectionText, message: "Error fetching definition." });
-        } finally {
-            setIsDictionaryLoading(false);
-        }
+        // close the selection menu
+        closeContextUI();
     };
 
 
@@ -719,66 +706,6 @@ export default function Reader({bookData, onClose}: readerProps) {
     </div>
             )}
         </div>
-
-        {/* DICTIONARY MODAL */}
-        {(dictionaryData || isDictionaryLoading) && (
-            <div className="absolute inset-0 z-[100] flex items-center justify-center p-6">
-                {/* Backdrop */}
-                <div
-                    className="absolute inset-0 bg-black/80 backdrop-blur-sm"
-                    onClick={() => {
-                        setDictionaryData(null);
-                        setIsDictionaryLoading(false);
-                        closeContextUI();
-                    }}
-                ></div>
-
-                {/* Content Card */}
-                <div className="relative bg-[#252525] w-full max-w-md max-h-[70vh] rounded-xl shadow-2xl overflow-hidden flex flex-col border border-white/10">
-                    <div className="p-6 overflow-y-auto">
-                        {isDictionaryLoading ? (
-                            <div className="flex justify-center p-10 text-gray-400">Loading...</div>
-                        ) : dictionaryData && (
-                            <>
-                                <h3 className="text-2xl font-bold text-white capitalize mb-1">
-                                    {dictionaryData.word}
-                                </h3>
-                                <p className="text-blue-400 text-sm mb-4">{dictionaryData.phonetic}</p>
-
-                                {dictionaryData.message ? (
-                                    <p className="text-gray-400">{dictionaryData.message}</p>
-                                ) : (
-                                    dictionaryData.meanings?.map((m: any, i: number) => (
-                                        <div key={i} className="mb-4">
-                                            <span className="text-xs uppercase tracking-widest text-gray-500 font-bold italic">
-                                                {m.partOfSpeech}
-                                            </span>
-                                            <p className="text-gray-200 mt-1">
-                                                {m.definitions[0].definition}
-                                            </p>
-                                            {m.definitions[0].example && (
-                                                <p className="text-gray-500 text-sm italic mt-2">
-                                                    "{m.definitions[0].example}"
-                                                </p>
-                                            )}
-                                        </div>
-                                    ))
-                                )}
-                            </>
-                        )}
-                    </div>
-                    <button
-                        onClick={() => {
-                            setDictionaryData(null);
-                            closeContextUI();
-                        }}
-                        className="w-full py-4 bg-white/5 hover:bg-white/10 border-t border-white/10 transition-colors font-bold"
-                    >
-                        CLOSE
-                    </button>
-                </div>
-            </div>
-        )}
     </>
 );
 
