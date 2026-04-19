@@ -37,6 +37,8 @@ export default function Reader({bookData, onClose}: readerProps) {
 
     // define list state for highlights
     const [highlightsList, setHighlightsList] = useState<{cfi: string, text: string}[]>([]);
+    // define state for searching the highlights
+    const [highlightsSearch, setHighlightsSearch] = useState<string>("");
 
     // define deleteMenu state for deleting highlights. this will use x,y values to determine where it should appear.
     const [deleteMenu, setDeleteMenu] = useState<{cfi: string} | null>(null)
@@ -83,9 +85,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         const newRendition = newBook.renderTo(viewerRef.current, {
             width: "100%",
             height: "100%",
-            minSpreadWidth: "1000",
             flow: "scrolled",
-            // manager: "continuous"
         }as any)
 
         // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
@@ -94,7 +94,8 @@ export default function Reader({bookData, onClose}: readerProps) {
                 // "-webkit-user-select": "none",
                 // "user-select": "none",
                 "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
-                "color": "#c2c2c2"
+                "color": "#c2c2c2",
+                // "padding": "0px !important"
             },
             "::selection": {
                 "background": "rgba(225,225,0,0.3)"
@@ -182,6 +183,17 @@ export default function Reader({bookData, onClose}: readerProps) {
 
         // 1. setup Spacebar and Shift + spacebar to go forward or backward.
         const handleKeyDown = (e: KeyboardEvent) => {
+
+            const target = e.target as HTMLElement;
+        if (
+            target.tagName === 'INPUT' || 
+            target.tagName === 'TEXTAREA' || 
+            target.isContentEditable
+        ) {
+            return; // Exit the function and do nothing if the user is typing
+            }
+
+
             if (e.code === "Space") {
                 if (e.shiftKey) {
                     rendition.prev();
@@ -242,9 +254,9 @@ export default function Reader({bookData, onClose}: readerProps) {
             touchEndX = e.changedTouches[0].screenX;
 
             const swipeDistance = touchStartX - touchEndX;
-            if (swipeDistance > 50) { 
+            if (swipeDistance > 100) { 
                 rendition.next(); // user swiped from right to left
-            } else if (swipeDistance < -50) {
+            } else if (swipeDistance < -100) {
                 rendition.prev(); // user swiped from left to right
             }
         };
@@ -408,24 +420,33 @@ export default function Reader({bookData, onClose}: readerProps) {
     }, [showSidebar, sidebarTab, bookHighlightsKey])
 
 
+
+    // define filtered highlights from highlightsList by using highlightsSearch
+    const filteredHighlights = highlightsList.filter((hl) => {
+        return hl.text.toLowerCase().includes(highlightsSearch.toLowerCase())
+    });
+
     // Render Highlights function
     const renderHighlights = () => {
-        if (highlightsList.length === 0) {
-            return <p className="p-4 text-center text-gray-500">No highlights yet.</p>;
+        if (filteredHighlights.length === 0) {                              // by default it won't be zero because "" just means get everything into filteredHighlights
+            return <p className="p-4 text-center text-gray-500">
+                {highlightsSearch ? "No Matching Highlights found" : "No Highlights Yet"}
+            </p>;
         }
 
-        return highlightsList.map((item, index) => {
+        return filteredHighlights.map((item, index) => {
             return (
                 <button
             key={item.cfi || index}
             className='text-left w-full py-3 px-4 border-b'
-            onClick={() => {
-                rendition.display(item.cfi);
+            onClick={ async () => {
+                await rendition.display(item.cfi);
+                await rendition.display(item.cfi); // double for hack, to display the proper position.
                 setShowSidebar(false);
             }}
             >
 
-                <p className="text-sm italic line-clamp-3 leading-relaxed">
+                <p className="text-sm italic leading-relaxed">
                     "{item.text}"
                 </p>
                 
@@ -573,10 +594,34 @@ export default function Reader({bookData, onClose}: readerProps) {
                                 </div>
                             )}
                             {sidebarTab === 'highlights' && (
-                                <div className="flex flex-col">
-                                    {renderHighlights()}
-                                </div>
-                            )}
+    <div className="flex flex-col h-full overflow-hidden">
+        {/* Scrollable Area */}
+        <div className="flex-1 overflow-y-auto">
+            {renderHighlights()}
+        </div>
+
+        {/* Search Bar at the bottom */}
+        <div className="p-3 border-t border-white/10 bg-[#1c1c1c]">
+            <div className="relative">
+                <input
+                    type="text"
+                    placeholder="Search highlights..."
+                    value={highlightsSearch}
+                    onChange={(e) => setHighlightsSearch(e.target.value)}
+                    className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                />
+                {highlightsSearch && (
+                    <button 
+                        onClick={() => setHighlightsSearch("")}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
+                    >
+                        ✕
+                    </button>
+                )}
+            </div>
+        </div>
+    </div>
+)}
                         </div>
                     </div>
 
