@@ -95,6 +95,8 @@ export default function Reader({bookData, onClose}: readerProps) {
                 // "user-select": "none",
                 "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
                 "color": "#c2c2c2",
+                "max-width": "1200px !important",
+                "margin": "0 auto !important"
                 // "padding": "0px !important"
             },
             "::selection": {
