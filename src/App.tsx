@@ -50,9 +50,9 @@ function App() {
 
 
 
-  useEffect(() => {
-    console.log("active book:", activeBook);
-  }, [activeBook]);
+  // useEffect(() => {
+  //   console.log("active book:", activeBook);
+  // }, [activeBook]);
 
   useEffect(() => {
     console.log("State updated:\n", books);

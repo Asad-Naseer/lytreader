@@ -55,6 +55,7 @@ export default function Reader({bookData, onClose}: readerProps) {
             const savedFontSize = await localforage.getItem<number>('reader-font-size');
             if (savedFontSize) {
                 setFontSize(savedFontSize);
+                console.log("saved font size applied", savedFontSize)
             }
         };
         loadSavedSettings();
@@ -73,8 +74,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         const newRendition = newBook.renderTo(viewerRef.current, {
             width: "100%",
             height: "100%",
-            minSpreadWidth: 1000,
-            gap: 40
+            minSpreadWidth: "1000" 
         }as any)
 
         // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
@@ -105,7 +105,9 @@ export default function Reader({bookData, onClose}: readerProps) {
         const loadSavedPositions = async () => {
             const savedCfi = await localforage.getItem<string>(`progress-${bookData.id}`);
             if (savedCfi) {
-                newRendition.display(savedCfi);
+                await newRendition.display(savedCfi);
+                await newRendition.display(savedCfi);
+                console.log("Saved cfi displayed,", savedCfi)
             } else {
                 newRendition.display();
             }
@@ -117,7 +119,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         // now calculate and update pageInfo state (page numbers)
 
         newBook.ready.then(() => {
-            return newBook.locations.generate(1024); // 1024 characters define a location chunk, which epub.js uses to approximate pages.
+            return newBook.locations.generate(100); // 1024 characters define a location chunk, which epub.js uses to approximate pages.
         }).then((_locations: any) => {
             const currentLocation = newRendition.currentLocation() as any; // this will be used only once to show the locations
 
@@ -131,6 +133,7 @@ export default function Reader({bookData, onClose}: readerProps) {
 
             // Save position to browser indexedDB via localforage
             localforage.setItem(`progress-${bookData.id}`, location.start.cfi);
+            console.log("cfi saved", location.start.cfi)
 
             if (location.start.displayed.total) {               // check if epubjs has already calculated total pages
                 setPageInfo(`${location.start.displayed.page} / ${location.start.displayed.total}`);
@@ -149,12 +152,13 @@ export default function Reader({bookData, onClose}: readerProps) {
     }, [bookData]);
 
 
-    // Apply and Saved Fontsize whenever it changes
+    // Apply and Save Fontsize whenever it changes
     useEffect(() => {
         if (rendition) {
             rendition.themes.fontSize(`${fontSize}%`);
             // Save globally to persist accross book reloads
             localforage.setItem('reader-font-size', fontSize);
+            console.log("Font size applied", fontSize)
         }
     }, [fontSize, rendition]);
 
