@@ -23,6 +23,15 @@ export default function Reader({bookData, onClose}: readerProps) {
     // define pending highlight var to check for when highlights start and deciding when to finalize them
     const pendingHighlight = useRef<{cfi: string, contents: any} | null>(null)
 
+    // define selection text for dictionary lookup
+    const [selectionText, setSelectionText] = useState<string>("");
+
+    // define dictionary data states for response received from the api
+    const [dictionaryData, setDictionaryData] = useState<any>(null);
+
+    // define dictionary loading state to for meaning card
+    const [isDictionaryLoading, setIsDictionaryLoading] = useState(false);
+
     // define bookHighlightsKey for loading book highlights
     const bookHighlightsKey = `highlights-${bookData.id}`;
 
@@ -74,7 +83,9 @@ export default function Reader({bookData, onClose}: readerProps) {
         const newRendition = newBook.renderTo(viewerRef.current, {
             width: "100%",
             height: "100%",
-            minSpreadWidth: "1000" 
+            minSpreadWidth: "1000",
+            flow: "scrolled",
+            // manager: "continuous"
         }as any)
 
         // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
@@ -193,8 +204,7 @@ export default function Reader({bookData, onClose}: readerProps) {
 
             // if a pending highlight is detected, finalize it immediately.
             if (pendingHighlight.current) {
-                const { cfi, contents } = pendingHighlight.current;
-                finalizeHighlight(cfi, contents)
+                setShowHeaderFooter(true);
                 return;
             }
 
@@ -297,9 +307,12 @@ export default function Reader({bookData, onClose}: readerProps) {
     useEffect(() => {
         if (!rendition || !book) return;
         const handleSelected = (cfiRange: string, contents: any) => {
+            const range = rendition.getRange(cfiRange);
+            const text = range.toString().trim();
 
-                // mark the cfi and contents passed to handleSelected as pending highlight
-                pendingHighlight.current = {cfi: cfiRange, contents}
+            // mark the cfi and contents passed to handleSelected as pending highlight & give the text to selectionText
+            pendingHighlight.current = {cfi: cfiRange, contents}
+            setSelectionText(text);
 
         };
 
@@ -443,34 +456,91 @@ export default function Reader({bookData, onClose}: readerProps) {
     };
 
 
+    // func for using dictionary api
+    const handleDictionaryLookup = async () => {
+        if (!selectionText) return;
+
+        setIsDictionaryLoading(true)
+
+        try {
+            const word = selectionText.split(/\s+/)[0].replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g,""); // selects the first word and removes the punctuation from it
+            const response = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${word}`)
+            const data = await response.json();
+
+            if (Array.isArray(data)) {
+                setDictionaryData(data[0])
+            } else {
+                setDictionaryData({ word, message: "No Definition Found."}) // message is one of the elements of the object of the array that the api sends us back, by using message here we can display our own.
+            }
+
+        } catch (error) {
+            setDictionaryData({ word: selectionText, message: "Error fetching definition." });
+        } finally {
+            setIsDictionaryLoading(false);
+        }
+    };
+
+
+    // func for closing context ui gracefully
+    const closeContextUI = () => {
+        pendingHighlight.current = null;
+        setSelectionText("");
+        setShowHeaderFooter(false);
+    }
+
+
+
     // WHAT THE READER ACTUALLY RENDERS:
 
     return (
-        <div className='flex flex-col absolute w-full h-full top-0 overflow-hidden'> 
-
+    <>
+        <div className='flex flex-col absolute w-full h-full top-0 overflow-hidden'>
             {/* TOP BAR */}
             {showHeaderFooter && (
                 <div className='absolute bg-[#1c1c1c] top-0 left-0 w-full z-10 flex justify-between items-center p-3 shadow-md'>
-                    <button 
-                        onClick={() => {
-                            setShowSidebar(true);
-                            setShowHeaderFooter(false); 
-                        }} 
-                        className='rounded py-2 pointer font-medium'>
-                        ☰ Menu
-                    </button>
+                    <div className="flex">
+                        {!pendingHighlight.current ? (
+                            <button
+                                onClick={() => { setShowSidebar(true); setShowHeaderFooter(false); }}
+                                className='rounded py-2 px-3 hover:bg-white/5'>
+                                ☰ Menu
+                            </button>
+                        ) : (
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={handleDictionaryLookup}
+                                    className="bg-blue-700 hover:bg-blue-500 px-4 py-2 rounded text-sm flex items-center gap-2">
+                                    <span>🔎</span>
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        const { cfi, contents } = pendingHighlight.current!;
+                                        finalizeHighlight(cfi, contents);
+                                        closeContextUI();
+                                    }}
+                                    className="bg-yellow-700 hover:bg-yellow-500 px-4 py-2 rounded text-sm font-medium">
+                                    ✏️
+                                </button>
+                                <button
+                                    onClick={closeContextUI}
+                                    className="px-4 py-2 text-sm rounded bg-[#e24741]">
+                                    Cancel
+                                </button>
+                            </div>
+                        )}
+                    </div>
 
                     {deleteMenu && (
                         <button
-                        onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
-                        className='bg-[#e24741] hover:bg-red-700 py-1.5 px-3 rounded transition-colors text-sm'
+                            onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
+                            className='bg-[#e24741] hover:bg-red-700 py-1.5 px-3 rounded transition-colors text-sm'
                         >
                             Delete Highlight
                         </button>
                     )}
 
-                    <button 
-                        onClick={onClose} 
+                    <button
+                        onClick={onClose}
                         className='bg-[#e24741] hover:bg-red-600 rounded px-4 py-2 pointer transition-colors font-medium'>
                         Close
                     </button>
@@ -482,14 +552,14 @@ export default function Reader({bookData, onClose}: readerProps) {
                 <div className="absolute inset-0 z-20 flex">
                     <div className="w-4/5 max-w-sm h-full bg-[#1c1c1c] flex flex-col">
                         <div className="flex border-b text-center">
-                            <button 
-                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'toc' ? 'border-b-4 ' : 'text-gray-500'}`}
+                            <button
+                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'toc' ? 'border-b-4' : 'text-gray-500'}`}
                                 onClick={() => setSidebarTab('toc')}
                             >
                                 Chapters
                             </button>
-                            <button 
-                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'highlights' ? 'border-b-4 ' : 'text-gray-500'}`}
+                            <button
+                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'highlights' ? 'border-b-4' : 'text-gray-500'}`}
                                 onClick={() => setSidebarTab('highlights')}
                             >
                                 Highlights
@@ -509,9 +579,9 @@ export default function Reader({bookData, onClose}: readerProps) {
                             )}
                         </div>
                     </div>
-                    
-                    <div 
-                        className="flex-1 bg-black/50" 
+
+                    <div
+                        className="flex-1 bg-black/50"
                         onClick={() => setShowSidebar(false)}
                     ></div>
                 </div>
@@ -520,55 +590,111 @@ export default function Reader({bookData, onClose}: readerProps) {
             {/* THE VIEWER */}
             <div ref={viewerRef} className='flex-1 overflow-hidden relative z-0'></div>
 
-
             {!showHeaderFooter && !showSidebar && (
-                <div className="absolute bottom-0 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+                <div className="absolute bottom-0 right-1 z-10 pointer-events-none">
                     <p className="text-[10px] uppercase tracking-widest text-white/40 font-semibold">
                         {pageInfo}
                     </p>
                 </div>
             )}
 
-
-
             {/* FOOTER */}
-            {/* FOOTER - Now conditional */}
-        {showHeaderFooter && (
-            <div className='p-1 flex items-center justify-between border-t relative z-10 bg-[#1c1c1c]'>
-                
-                <div className="relative w-1/3 pl-4">
-                    <button 
-                        onClick={() => setShowFontMenu(!showFontMenu)} 
-                        className="ml-4 p-2 rounded font-bold w-10 h-10 flex items-center justify-center">
-                        Aa
+            {showHeaderFooter && (
+                <div className='p-1 flex items-center justify-between border-t relative z-10 bg-[#1c1c1c]'>
+                    <div className="relative w-1/3 pl-4">
+                        <button
+                            onClick={() => setShowFontMenu(!showFontMenu)}
+                            className="ml-4 p-2 rounded font-bold w-10 h-10 flex items-center justify-center">
+                            Aa
+                        </button>
+
+                        {showFontMenu && (
+                            <div className="absolute bottom-full left-0 mb-3 bg-[#1c1c1c] p-2 rounded shadow-lg border flex items-center gap-3">
+                                <button
+                                    onClick={() => setFontSize(f => Math.max(50, f - 10))}
+                                    className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center">
+                                    -
+                                </button>
+                                <span className="w-12 text-center font-medium">{fontSize}%</span>
+                                <button
+                                    onClick={() => setFontSize(f => Math.min(300, f + 10))}
+                                    className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center">
+                                    +
+                                </button>
+                            </div>
+                        )}
+                    </div>
+
+                    <div className='text-center'>
+                        Page {pageInfo}
+                    </div>
+
+                    <div className="w-1/3"></div>
+                </div>
+            )}
+        </div>
+
+        {/* DICTIONARY MODAL */}
+        {(dictionaryData || isDictionaryLoading) && (
+            <div className="absolute inset-0 z-[100] flex items-center justify-center p-6">
+                {/* Backdrop */}
+                <div
+                    className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+                    onClick={() => {
+                        setDictionaryData(null);
+                        setIsDictionaryLoading(false);
+                        closeContextUI();
+                    }}
+                ></div>
+
+                {/* Content Card */}
+                <div className="relative bg-[#252525] w-full max-w-md max-h-[70vh] rounded-xl shadow-2xl overflow-hidden flex flex-col border border-white/10">
+                    <div className="p-6 overflow-y-auto">
+                        {isDictionaryLoading ? (
+                            <div className="flex justify-center p-10 text-gray-400">Loading...</div>
+                        ) : dictionaryData && (
+                            <>
+                                <h3 className="text-2xl font-bold text-white capitalize mb-1">
+                                    {dictionaryData.word}
+                                </h3>
+                                <p className="text-blue-400 text-sm mb-4">{dictionaryData.phonetic}</p>
+
+                                {dictionaryData.message ? (
+                                    <p className="text-gray-400">{dictionaryData.message}</p>
+                                ) : (
+                                    dictionaryData.meanings?.map((m: any, i: number) => (
+                                        <div key={i} className="mb-4">
+                                            <span className="text-xs uppercase tracking-widest text-gray-500 font-bold italic">
+                                                {m.partOfSpeech}
+                                            </span>
+                                            <p className="text-gray-200 mt-1">
+                                                {m.definitions[0].definition}
+                                            </p>
+                                            {m.definitions[0].example && (
+                                                <p className="text-gray-500 text-sm italic mt-2">
+                                                    "{m.definitions[0].example}"
+                                                </p>
+                                            )}
+                                        </div>
+                                    ))
+                                )}
+                            </>
+                        )}
+                    </div>
+                    <button
+                        onClick={() => {
+                            setDictionaryData(null);
+                            closeContextUI();
+                        }}
+                        className="w-full py-4 bg-white/5 hover:bg-white/10 border-t border-white/10 transition-colors font-bold"
+                    >
+                        CLOSE
                     </button>
-                    
-                    {showFontMenu && (
-                        <div className="absolute bottom-full left-0 mb-3 bg-[#1c1c1c] p-2 rounded shadow-lg border flex items-center gap-3">
-                            <button 
-                                onClick={() => setFontSize(f => Math.max(50, f - 10))} 
-                                className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center">
-                                -
-                            </button>
-                            <span className="w-12 text-center font-medium">{fontSize}%</span>
-                            <button 
-                                onClick={() => setFontSize(f => Math.min(300, f + 10))} 
-                                className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center">
-                                +
-                            </button>
-                        </div>
-                    )}
                 </div>
-
-                <div className='text-center'>
-                    Page {pageInfo}
-                </div>
-
-                <div className="w-1/3"></div>
             </div>
         )}
-    </div>
-    )
+    </>
+);
 
 
 }
