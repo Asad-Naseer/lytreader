@@ -12,6 +12,6 @@ Uses IndexedDB to store Bookmarks and Reading positions.
 [Here](asad-naseer.github.io/lytreader/)
 
 ## Future updates to come:
-> Chapter and percentage info on the highlights
-> Cross-device sync
-> Search across the entire book
+Chapter and percentage info on the highlights
+Cross-device sync
+Search across the entire book
