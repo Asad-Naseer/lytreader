@@ -9,7 +9,7 @@ Uses bun as package manager.
 Uses IndexedDB to store Bookmarks and Reading positions.
 
 ## Try it out 
-[Here](asad-naseer.github.io/lytreader/)
+<a href="https://asad-naseer.github.io/lytreader/" target="_blank">Here</a>
 
 ## Future updates to come:
 
