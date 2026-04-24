@@ -15,10 +15,20 @@ interface tocItem {
     subitems?: tocItem[]
 }
 
+interface highlightItem {
+    cfi: string;
+    text: string;
+    chapter?: string;
+    percentage?: number;
+}
+
 export default function Reader({bookData, onClose}: readerProps) {
 
     // define a ref html div element to pass to epubjs so it can render the book into it
     const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
+
+    // define a promise ref for generation of locations 
+    const locationsPromiseRef = useRef<Promise<any> | null>(null);
 
     // define pending highlight var to check for when highlights start and deciding when to finalize them
     const pendingHighlight = useRef<{cfi: string, contents: any} | null>(null)
@@ -30,7 +40,7 @@ export default function Reader({bookData, onClose}: readerProps) {
     const bookHighlightsKey = `highlights-${bookData.id}`;
 
     // define list state for highlights
-    const [highlightsList, setHighlightsList] = useState<{cfi: string, text: string}[]>([]);
+    const [highlightsList, setHighlightsList] = useState<highlightItem[]>([]);
     // define state for searching the highlights
     const [highlightsSearch, setHighlightsSearch] = useState<string>("");
 
@@ -41,6 +51,10 @@ export default function Reader({bookData, onClose}: readerProps) {
     const [book, setBook] = useState<any>(null);
     const [rendition, setRendition] = useState<any>(null)
     const [pageInfo, setPageInfo] = useState<string>("Calculating")
+
+    // define states for the persisten footer 
+    const [currentChapter, setCurrentChapter] = useState<string>("Unknown Chapter");
+    const [currentPercentage, setCurrentPercentage] = useState<number>(0);
 
     // define a state to control the visibility of the header
     const [showHeaderFooter, setShowHeaderFooter] = useState<boolean>(false);
@@ -107,12 +121,12 @@ export default function Reader({bookData, onClose}: readerProps) {
                 // "user-select": "none",
                 "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
                 "color": "#c2c2c2",
-                "max-width": "1200px !important",
-                "margin": "0 auto !important"
+                "max-width": "1000px !important",
+                "margin": "0 auto !important",
                 // "padding": "0px !important"
             },
             "::selection": {
-                "background": "rgba(225,225,0,0.3)"
+                "background": "rgba(255, 255, 0, 0.3)"
             },
             ".epubjs-hl": {
                 "fill": "yellow",
@@ -148,7 +162,9 @@ export default function Reader({bookData, onClose}: readerProps) {
         // now calculate and update pageInfo state (page numbers)
 
         newBook.ready.then(() => {
-            return newBook.locations.generate(100); // 1024 characters define a location chunk, which epub.js uses to approximate pages.
+            // save location generation in a promise so we can await it later (this is for correct percentage generation for the highlights, see finalizeHighlight function)
+            locationsPromiseRef.current = newBook.locations.generate(100);
+            return locationsPromiseRef.current; // 100 characters define a location chunk, which epub.js uses to approximate pages.
         }).then((_locations: any) => {
             const currentLocation = newRendition.currentLocation() as any; // this will be used only once to show the locations
 
@@ -158,7 +174,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         });
 
         // setup state updates for whenver user turns a page (rendition relocates)
-        newRendition.on("relocated", (location:any) => {
+        newRendition.on("relocated", async (location:any) => {
 
             // Save position to browser indexedDB via localforage
             localforage.setItem(`progress-${bookData.id}`, location.start.cfi);
@@ -167,6 +183,50 @@ export default function Reader({bookData, onClose}: readerProps) {
             if (location.start.displayed.total) {               // check if epubjs has already calculated total pages
                 setPageInfo(`${location.start.displayed.page} / ${location.start.displayed.total}`);
             }
+
+            // 1. Get Current Chapter (Loads instantly)
+            let chapter = "Unknown Chapter";
+            try {
+                const spineItem = newBook.spine.get(location.start.cfi);
+                if (spineItem) {
+                    const nav = await newBook.loaded.navigation;
+                    const bookToc = nav.toc;
+                    
+                    const searchToc = (items: tocItem[], href: string): string | null => {
+                        for (const item of items) {
+                            if (item.href === href || item.href.split('#')[0] === href) return item.label;
+                            if (item.subitems && item.subitems.length > 0) {
+                                const found = searchToc(item.subitems, href);
+                                if (found) return found;
+                            }
+                        }
+                        return null;
+                    };
+                    
+                    const foundTitle = searchToc(bookToc, spineItem.href);
+                    if (foundTitle) chapter = foundTitle.trim();
+                }
+            } catch (error) {
+                console.error("Error fetching current chapter:", error);
+            }
+            setCurrentChapter(chapter);
+
+            // 2. Get Current Percentage (Waits for generation if needed)
+            let percent = 0;
+            try {
+                if (locationsPromiseRef.current) {
+                    await locationsPromiseRef.current; // wait if it's still generating
+                }
+                if (newBook.locations && newBook.locations.length() > 0) {
+                    const percentCfi = newBook.locations.percentageFromCfi(location.start.cfi);
+                    if (percentCfi > 0) {
+                        percent = Math.round(percentCfi * 100);
+                    }
+                }
+            } catch (err) {
+                console.error("Error waiting for locations to generate:", err);
+            }
+            setCurrentPercentage(percent);
         })
 
         // finally set the rendition state
@@ -318,13 +378,64 @@ export default function Reader({bookData, onClose}: readerProps) {
             console.log("Clicked Highlight:", cfiRange, e, contents)
         })
 
-        // save to localforage
+
+        
+
+        // get the text
         const range = await book.getRange(cfiRange);
         const text = range.toString();
-        const existingHighlights: {cfi: string, text: string}[] = await localforage.getItem(bookHighlightsKey) || [];
+
+        // calc the percentage
+
+        // 1. Calculate the Percentage
+        let percentage = 0;
+        try {
+            // If the background page generation is still running, wait for it to finish
+            if (locationsPromiseRef.current) {
+                await locationsPromiseRef.current;
+            }
+
+            // Now that we are 100% sure locations are generated, calculate it
+            if (book.locations && book.locations.length() > 0) {
+                const percentCfi = book.locations.percentageFromCfi(cfiRange);
+                if (percentCfi > 0) {
+                    percentage = Math.round(percentCfi * 100);
+                }
+            }
+        } catch (err) {
+            console.error("Error waiting for locations to generate:", err);
+        }
+
+        // 2. Calculate the Chapter Title
+        let chapter = "Unknown Chapter";
+        try {
+            const spineItem = book.spine.get(cfiRange);
+            if (spineItem) {
+                // helper function to search through the TOC
+                const searchToc = (items: tocItem[], href: string): string | null => {
+                    for (const item of items) {
+                        // Match exact href or just the file path without HTML anchors (#)
+                        if (item.href === href || item.href.split('#')[0] === href) return item.label;
+                        if (item.subitems && item.subitems.length > 0) {
+                            const found = searchToc(item.subitems, href);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+                
+                const foundTitle = searchToc(toc, spineItem.href);
+                if (foundTitle) chapter = foundTitle.trim();
+            }
+        } catch (error) {
+            console.error("Error fetching chapter title for highlight:", error);
+        }
+
+
+        const existingHighlights: highlightItem[] = await localforage.getItem(bookHighlightsKey) || [];
 
         if (!existingHighlights.find(h => h.cfi === cfiRange)) {
-            existingHighlights.push({ cfi: cfiRange, text: text });
+            existingHighlights.push({ cfi: cfiRange, text: text, chapter, percentage });
             await localforage.setItem(bookHighlightsKey, existingHighlights);
         }
 
@@ -363,7 +474,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         const applySavedHighlights = async () => {
             
             // get array of CFIs and Texts from storage
-            const savedHighlights: {cfi: string, text: string}[] = await localforage.getItem(bookHighlightsKey) || [];
+            const savedHighlights: highlightItem[] = await localforage.getItem(bookHighlightsKey) || [];
 
             // loop through the highlights and apply them
             savedHighlights.forEach(hl => {
@@ -405,7 +516,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         rendition.annotations.remove(cfi, 'highlight');
 
         // remove from localforage 
-        const existingHighlights: {cfi: string, text: string}[] = await localforage.getItem(bookHighlightsKey) || [];
+        const existingHighlights: highlightItem[] = await localforage.getItem(bookHighlightsKey) || [];
         const updatedHighlights = existingHighlights.filter(h => h.cfi !== cfi);
         await localforage.setItem(bookHighlightsKey, updatedHighlights);
 
@@ -419,7 +530,7 @@ export default function Reader({bookData, onClose}: readerProps) {
     useEffect(() => {
         if (showSidebar && sidebarTab === 'highlights') {
             const load = async () => {
-                const data = await localforage.getItem<{cfi: string, text: string}[]>(bookHighlightsKey);
+                const data = await localforage.getItem<highlightItem[]>(bookHighlightsKey);
 
                 if (data) {
                     //sort descending compare b to a 
@@ -463,9 +574,19 @@ export default function Reader({bookData, onClose}: readerProps) {
             }}
             >
 
-                <p className="text-sm italic leading-relaxed">
-                    "{item.text}"
-                </p>
+                {/* Chapter and Percentage Header */}
+                    <div className="w-full flex justify-between items-start text-[10px] text-gray-400 uppercase tracking-widest font-semibold mb-1">
+                        <span className="truncate pr-2">
+                            {item.chapter || "Unknown Chapter"}
+                        </span>
+                        <span>
+                            {item.percentage !== undefined ? `${item.percentage}%` : ""}
+                        </span>
+                    </div>
+
+                    <p className="text-sm italic leading-relaxed">
+                        "{item.text}"
+                    </p>
                 
             </button>
             )
@@ -494,7 +615,7 @@ export default function Reader({bookData, onClose}: readerProps) {
     };
 
 
-    // func for opening a Google search in a new tab [study this]
+    // func for opening a Google search in a new tab 
     const handleDictionaryLookup = () => {
         if (!selectionText) return;
 
@@ -645,11 +766,18 @@ export default function Reader({bookData, onClose}: readerProps) {
             {/* THE VIEWER */}
             <div ref={viewerRef} className='flex-1 overflow-hidden relative z-0'></div>
 
+            {/* PERSISTENT FOOTER */}
             {!showHeaderFooter && !showSidebar && (
-                <div className="absolute bottom-0 right-1 z-10 pointer-events-none">
-                    <p className="text-[10px] uppercase tracking-widest text-white/40 font-semibold">
-                        {pageInfo}
-                    </p>
+                <div className="h-6 w-full shrink-0 flex items-center justify-between px-4 text-[10px] text-white/40 uppercase tracking-widest font-semibold bg-[#1c1c1c] relative z-10">
+                    <div className="flex-1">{pageInfo}</div> {/* Empty space for left balance */}
+                    
+                    <div className="flex-1 text-center truncate px-2">
+                        {currentChapter}
+                    </div>
+                    
+                    <div className="flex-1 text-right">
+                        {currentPercentage}%
+                    </div>
                 </div>
             )}
 
@@ -684,7 +812,7 @@ export default function Reader({bookData, onClose}: readerProps) {
         <div className='flex items-center gap-6'>
             <button 
                 onClick={() => rendition?.prev()}
-                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 hover:bg-white/40 active:bg-white/70"
+                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 active:bg-white/70"
             >
                 ‹
             </button>
@@ -695,7 +823,7 @@ export default function Reader({bookData, onClose}: readerProps) {
 
             <button 
                 onClick={() => rendition?.next()}
-                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 hover:bg-white/40 active:bg-white/70"
+                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 active:bg-white/70"
             >
                 ›
             </button>
