@@ -22,7 +22,21 @@ interface highlightItem {
     percentage?: number;
 }
 
+interface SearchResult {
+    cfi: string;
+    excerpt: string;
+    chapter: string;
+    percentage?: number;
+}
+
 export default function Reader({bookData, onClose}: readerProps) {
+
+    // Global book search states
+    const[showSearch, setShowSearch] = useState<boolean>(false);
+    const [searchQuery, setSearchQuery] = useState<string>("");
+    const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+    const[isSearching, setIsSearching] = useState<boolean>(false);
+    const searchIdRef = useRef<number>(0);
 
     // define a ref html div element to pass to epubjs so it can render the book into it
     const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
@@ -65,6 +79,9 @@ export default function Reader({bookData, onClose}: readerProps) {
     // states for handling photos in sidebarTab
     const [photosList, setPhotosList] = useState<string[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(false);
+    // we will use this for preventing memory leaks. (see loadPhotos function in fetch photos useEffect())
+    const photoBlobUrlsRef = useRef<string[]>([]);
+    // state for handling toc
     const [toc, setToc] = useState<tocItem[]>([]);
 
     // Fontsize states
@@ -595,6 +612,7 @@ export default function Reader({bookData, onClose}: readerProps) {
                             const blob = await book.load(item.href);
                             if (blob instanceof Blob) {
                                 url = URL.createObjectURL(blob);
+                                photoBlobUrlsRef.current.push(url);
                             }
                         } catch (e) {
                             console.warn("[Photos] book.load failed for", item.href, e);
@@ -624,6 +642,8 @@ export default function Reader({bookData, onClose}: readerProps) {
 
         return () => {
             cancelled = true; // discard results if effect re-fires before async finishes
+            photoBlobUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+            photoBlobUrlsRef.current = [];
         };
     }, [showSidebar, sidebarTab, book]);
 
@@ -721,6 +741,108 @@ export default function Reader({bookData, onClose}: readerProps) {
     }
 
 
+    // func for searching entire book
+    // Search the entire book (streams results as it goes)
+    const executeSearch = async (query: string) => {
+        if (!book || !query.trim()) return;
+        
+        // Increment the search ID. This allows us to cancel this loop if the user types another letter.
+        const currentSearchId = ++searchIdRef.current;
+        
+        setIsSearching(true);
+        setSearchResults([]);
+
+        try {
+            if (locationsPromiseRef.current) {
+                await locationsPromiseRef.current;
+            }
+
+            const results: SearchResult[] =[];
+            const spineItems = book.spine.spineItems;
+
+            for (let i = 0; i < spineItems.length; i++) {
+                // If the user typed something else, the ID will have changed. Abort this search.
+                if (currentSearchId !== searchIdRef.current) return;
+
+                const item = spineItems[i];
+                await item.load(book.load.bind(book));
+                const matches = item.find(query);
+                item.unload();
+
+                if (matches && matches.length > 0) {
+                    const searchToc = (items: tocItem[], targetHref: string): string | null => {
+                        for (const t of items) {
+                            if (t.href === targetHref || t.href.split('#')[0] === targetHref) return t.label;
+                            if (t.subitems && t.subitems.length > 0) {
+                                const found = searchToc(t.subitems, targetHref);
+                                if (found) return found;
+                            }
+                        }
+                        return null;
+                    };
+
+                    let chapterName = searchToc(toc, item.href) || "Unknown Chapter";
+
+                    for (const match of matches) {
+                        let percentage = 0;
+                        if (book.locations && book.locations.length() > 0) {
+                            const percentCfi = book.locations.percentageFromCfi(match.cfi);
+                            if (percentCfi > 0) {
+                                percentage = Math.round(percentCfi * 100);
+                            }
+                        }
+
+                        results.push({
+                            cfi: match.cfi,
+                            excerpt: match.excerpt,
+                            chapter: chapterName.trim(),
+                            percentage
+                        });
+                    }
+                    
+                    // Stream results to the UI instantly!
+                    if (currentSearchId === searchIdRef.current) {
+                        setSearchResults([...results]);
+                    }
+                }
+            }
+
+            // Mark as done when the loop completely finishes
+            if (currentSearchId === searchIdRef.current) {
+                setIsSearching(false);
+            }
+
+        } catch (error) {
+            console.error("Search failed:", error);
+            if (currentSearchId === searchIdRef.current) setIsSearching(false);
+        }
+    };
+
+    // Auto-trigger search when user types (with 500ms debounce)
+    useEffect(() => {
+        // If the query is cleared, reset everything and kill active searches
+        if (!searchQuery.trim()) {
+            searchIdRef.current++; // <--- THIS ABORTS THE BACKGROUND LOOP
+            setSearchResults([]);
+            setIsSearching(false);
+            return;
+        }
+
+        // Wait 500ms before executing the search to prevent freezing while typing
+        const delayFn = setTimeout(() => {
+            executeSearch(searchQuery);
+        }, 500);
+
+        // Cleanup timeout if user types again before 500ms is up
+        return () => clearTimeout(delayFn);
+    }, [searchQuery]);
+
+
+    // Safely escape regex characters to prevent crashes, and ignore empty queries
+    const highlightQuery = searchQuery.trim();
+    const safeRegex = highlightQuery ? new RegExp(`(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi') : null;
+
+
 
     // WHAT THE READER ACTUALLY RENDERS:
 
@@ -778,6 +900,93 @@ export default function Reader({bookData, onClose}: readerProps) {
                     </button>
                 </div>
             )}
+
+            {/* SEARCH OVERLAY CARD */}
+            {showSearch && (
+                <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
+                    <div className="bg-[#1c1c1c] w-full max-w-lg h-[80%] max-h-[700px] rounded-lg shadow-2xl border border-white/10 flex flex-col overflow-hidden">
+                        
+                        {/* Search Card Header */}
+                        <div className="flex items-center justify-between p-4 border-b border-white/10 bg-black/20">
+                            <h2 className="font-semibold text-white tracking-wide">Search Book</h2>
+                            <button 
+                                onClick={() => setShowSearch(false)} 
+                                className="text-gray-400 hover:text-white px-2 rounded hover:bg-white/10 transition-colors">
+                                ✕
+                            </button>
+                        </div>
+
+                        {/* Search Input Area */}
+                        <div className="p-4 border-b border-white/10 bg-white/5">
+                            <input
+                                type="text"
+                                placeholder="Start typing to search..."
+                                value={searchQuery}
+                                onChange={(e) => setSearchQuery(e.target.value)}
+                                className="w-full bg-[#121212] border border-white/20 rounded-md px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors text-white placeholder-gray-500"
+                            />
+                        </div>
+
+                        {/* Search Results Area */}
+                        <div className="flex-1 overflow-y-auto p-2 bg-[#1c1c1c]">
+                            {searchResults.length > 0 ? (
+                                <div className="space-y-1">
+                                    {searchResults.map((res, i) => (
+                                        <button
+                                            key={i}
+                                            onClick={async () => {
+                                                await rendition.display(res.cfi);
+                                                await rendition.display(res.cfi); // Double execution hack
+                                                setShowSearch(false);
+                                            }}
+                                            className="w-full text-left p-4 hover:bg-white/5 rounded-lg border-b border-white/5 transition-colors focus:bg-white/10 focus:outline-none"
+                                        >
+                                            <div className="flex justify-between items-start text-[10px] text-gray-400 uppercase tracking-widest font-semibold mb-2">
+                                                <span className="truncate pr-2">{res.chapter}</span>
+                                                <span className="shrink-0">{res.percentage}%</span>
+                                            </div>
+                                            
+                                            <p className="text-sm text-gray-300 italic leading-relaxed">
+                                                {safeRegex ? (
+                                                    (res.excerpt || "").split(safeRegex).map((part, index) => 
+                                                        part.toLowerCase() === highlightQuery.toLowerCase() ? (
+                                                            <mark key={index} className="bg-yellow-500/40 text-white rounded px-1">{part}</mark>
+                                                        ) : (
+                                                            part
+                                                        )
+                                                    )
+                                                ) : (
+                                                    res.excerpt
+                                                )}
+                                            </p>
+                                        </button>
+                                    ))}
+                                    
+                                    {/* Show a mini loading indicator at the bottom if it's still scanning remaining chapters */}
+                                    {isSearching && (
+                                        <div className="text-center text-gray-500 py-4 text-xs uppercase tracking-widest animate-pulse font-semibold">
+                                            Scanning remaining chapters...
+                                        </div>
+                                    )}
+                                </div>
+                            ) : isSearching ? (
+                                <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                                    <div className="animate-spin text-2xl mb-4">⏳</div>
+                                    <p className="text-sm">Scanning entire book...</p>
+                                </div>
+                            ) : searchQuery ? (
+                                <p className="text-center text-gray-500 mt-10 text-sm">No results found for "{searchQuery}".</p>
+                            ) : (
+                                <p className="text-center text-gray-500 mt-10 text-sm">Type a keyword to begin searching.</p>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+
+
+
 
             {/* SIDEBAR OVERLAY */}
             {showSidebar && (
@@ -955,7 +1164,14 @@ export default function Reader({bookData, onClose}: readerProps) {
         </div>
 
         {/* Right Side: Spacer to keep center balanced */}
-        <div className="w-1/3"></div>
+        <div className="w-1/3 flex justify-end">
+            <button
+            onClick={() => { setShowSearch(true); setShowHeaderFooter(false); }}
+            className='rounded py-2 px-3 hover:bg-white/5'
+            >
+            Search 🔎
+            </button>
+        </div>
     </div>
             )}
         </div>
