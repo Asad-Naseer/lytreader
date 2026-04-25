@@ -70,6 +70,9 @@ export default function Reader({bookData, onClose}: readerProps) {
     const [currentChapter, setCurrentChapter] = useState<string>("Unknown Chapter");
     const [currentPercentage, setCurrentPercentage] = useState<number>(0);
 
+    // add states for currentChapterHref for exact location tracking when reading a trilogy or multi-book epub
+    const [currentChapterHref, setCurrentChapterHref] = useState<string>("");
+
     // define a state to control the visibility of the header
     const [showHeaderFooter, setShowHeaderFooter] = useState<boolean>(false);
 
@@ -206,15 +209,16 @@ export default function Reader({bookData, onClose}: readerProps) {
 
             // 1. Get Current Chapter (Loads instantly)
             let chapter = "Unknown Chapter";
+            let activeHref = "";
             try {
                 const spineItem = newBook.spine.get(location.start.cfi);
                 if (spineItem) {
                     const nav = await newBook.loaded.navigation;
                     const bookToc = nav.toc;
                     
-                    const searchToc = (items: tocItem[], href: string): string | null => {
+                    const searchToc = (items: tocItem[], href: string): tocItem | null => {
                         for (const item of items) {
-                            if (item.href === href || item.href.split('#')[0] === href) return item.label;
+                            if (item.href === href || item.href.split('#')[0] === href) return item;
                             if (item.subitems && item.subitems.length > 0) {
                                 const found = searchToc(item.subitems, href);
                                 if (found) return found;
@@ -223,13 +227,17 @@ export default function Reader({bookData, onClose}: readerProps) {
                         return null;
                     };
                     
-                    const foundTitle = searchToc(bookToc, spineItem.href);
-                    if (foundTitle) chapter = foundTitle.trim();
+                    const foundItem = searchToc(bookToc, spineItem.href);
+                    if (foundItem) {
+                        chapter = foundItem.label.trim();
+                        activeHref = foundItem.href;
+                    }
                 }
             } catch (error) {
                 console.error("Error fetching current chapter:", error);
             }
             setCurrentChapter(chapter);
+            setCurrentChapterHref(activeHref);
 
             // 2. Get Current Percentage (Waits for generation if needed)
             let percent = 0;
@@ -545,6 +553,21 @@ export default function Reader({bookData, onClose}: readerProps) {
     }
 
 
+    // Auto-scroll to the active chapter when the TOC sidebar is opened
+    useEffect(() => {
+        if (showSidebar && sidebarTab === 'toc') {
+            // We use a tiny timeout to ensure the DOM has finished rendering the sidebar before we scroll
+            const timer = setTimeout(() => {
+                const activeEl = document.getElementById("active-toc-item");
+                if (activeEl) {
+                    activeEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                }
+            }, 50);
+
+            return () => clearTimeout(timer);
+        }
+    },[showSidebar, sidebarTab, currentChapterHref]);
+
 
     // fetch highlights data whenever sidebar opens
     useEffect(() => {
@@ -696,22 +719,33 @@ export default function Reader({bookData, onClose}: readerProps) {
 
     // Render TOC function
     const renderToc = (items: tocItem[], level = 0) => {
-        return items.map((item, index) => (
-            <div key={item.id || index}>
-                <button
-                    className="text-left w-full py-3 px-4 border-b"
-                    style={{ paddingLeft: `${(level * 1.5) + 1}rem` }} // if level is non zero meaning subitems are being rendered, this will add some padding to them
-                    onClick={() => {
-                        rendition.display(item.href);
-                        setShowSidebar(false);
-                        setShowHeaderFooter(false);
-                    }}
-                >
-                    {item.label}
-                </button>
-                {item.subitems && item.subitems.length > 0 && renderToc(item.subitems, level + 1)}
-            </div>
-        ));
+        return items.map((item, index) => {
+            // Check if this item is the chapter the user is currently reading
+            const isActive = item.href === currentChapterHref;
+            
+            return (
+                <div key={item.id || index}>
+                    <button
+                        id={isActive ? "active-toc-item" : undefined}
+                        className={`w-full py-3 pr-4 border-b flex justify-between items-center transition-colors text-left ${
+                            isActive 
+                                ? 'text-yellow-500 font-bold bg-white/5 border-white/20' 
+                                : 'text-gray-200 hover:bg-white/5 border-white/5'
+                        }`}
+                        style={{ paddingLeft: `${(level * 1.5) + 1}rem` }}
+                        onClick={async () => {
+                            await rendition.display(item.href);
+                            setShowSidebar(false);
+                            setShowHeaderFooter(false);
+                        }}
+                    >
+                        <span className="truncate pr-4">{item.label}</span>
+                        {isActive && <span className="text-yellow-500 text-sm shrink-0">✓</span>}
+                    </button>
+                    {item.subitems && item.subitems.length > 0 && renderToc(item.subitems, level + 1)}
+                </div>
+            );
+        });
     };
 
 
@@ -761,15 +795,46 @@ export default function Reader({bookData, onClose}: readerProps) {
             const spineItems = book.spine.spineItems;
 
             for (let i = 0; i < spineItems.length; i++) {
-                // If the user typed something else, the ID will have changed. Abort this search.
                 if (currentSearchId !== searchIdRef.current) return;
 
                 const item = spineItems[i];
                 await item.load(book.load.bind(book));
                 const matches = item.find(query);
+                
+                // 1. EXTRACT FULL PARAGRAPHS BEFORE UNLOADING
+                const expandedMatches: {cfi: string, excerpt: string}[] =[];
+                
+                if (matches && matches.length > 0) {
+                    for (const match of matches) {
+                        let fullExcerpt = match.excerpt;
+                        try {
+                            // Resolve the CFI to the actual HTML DOM Nodes inside the chapter
+                            const range = await book.getRange(match.cfi);
+                            if (range && range.startContainer) {
+                                let node: any = range.startContainer;
+                                
+                                // If we landed on a Text Node, move up to the actual HTML Element
+                                if (node.nodeType === 3) node = node.parentNode;
+                                
+                                // Traverse up the DOM tree to find the nearest paragraph or structural block
+                                const block = node.closest?.('p, div, section, li, h1, h2, h3, h4, h5, h6') || node;
+                                if (block && block.textContent) {
+                                    // Remove weird line breaks/tabs and grab the whole paragraph!
+                                    fullExcerpt = block.textContent.replace(/\s+/g, ' ').trim();
+                                }
+                            }
+                        } catch (err) {
+                            console.warn("Could not expand excerpt context", err);
+                        }
+                        expandedMatches.push({ cfi: match.cfi, excerpt: fullExcerpt });
+                    }
+                }
+
+                // 2. SAFE TO UNLOAD CHAPTER FROM MEMORY NOW
                 item.unload();
 
-                if (matches && matches.length > 0) {
+                // 3. PROCESS THE RESULTS USING THE EXPANDED MATCHES
+                if (expandedMatches.length > 0) {
                     const searchToc = (items: tocItem[], targetHref: string): string | null => {
                         for (const t of items) {
                             if (t.href === targetHref || t.href.split('#')[0] === targetHref) return t.label;
@@ -783,7 +848,7 @@ export default function Reader({bookData, onClose}: readerProps) {
 
                     let chapterName = searchToc(toc, item.href) || "Unknown Chapter";
 
-                    for (const match of matches) {
+                    for (const match of expandedMatches) {
                         let percentage = 0;
                         if (book.locations && book.locations.length() > 0) {
                             const percentCfi = book.locations.percentageFromCfi(match.cfi);
@@ -794,13 +859,13 @@ export default function Reader({bookData, onClose}: readerProps) {
 
                         results.push({
                             cfi: match.cfi,
-                            excerpt: match.excerpt,
+                            excerpt: match.excerpt, // This now contains the full sentence/paragraph!
                             chapter: chapterName.trim(),
                             percentage
                         });
                     }
                     
-                    // Stream results to the UI instantly!
+                    // Stream results to UI
                     if (currentSearchId === searchIdRef.current) {
                         setSearchResults([...results]);
                     }
