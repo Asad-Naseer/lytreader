@@ -53,6 +53,9 @@ export default function Reader({bookData, onClose}: readerProps) {
     // define bookHighlightsKey for loading book highlights
     const bookHighlightsKey = `highlights-${bookData.id}`;
 
+    // Define the key for locations storage
+    const bookLocationsKey = `locations-${bookData.id}`;
+
     // define list state for highlights
     const [highlightsList, setHighlightsList] = useState<highlightItem[]>([]);
     // define state for searching the highlights
@@ -86,6 +89,11 @@ export default function Reader({bookData, onClose}: readerProps) {
     const photoBlobUrlsRef = useRef<string[]>([]);
     // state for handling toc
     const [toc, setToc] = useState<tocItem[]>([]);
+
+
+    // Safely escape regex characters to prevent crashes, and ignore empty queries ( for searching the entire book ), see search results area section.
+    const highlightQuery = searchQuery.trim();
+    const safeRegex = highlightQuery ? new RegExp(`(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi') : null;
 
     // Fontsize states
     const [fontSize, setFontSize] = useState<number>(100) // percentage
@@ -184,14 +192,33 @@ export default function Reader({bookData, onClose}: readerProps) {
 
         // now calculate and update pageInfo state (page numbers)
 
-        newBook.ready.then(() => {
-            // save location generation in a promise so we can await it later (this is for correct percentage generation for the highlights, see finalizeHighlight function)
-            locationsPromiseRef.current = newBook.locations.generate(100);
-            return locationsPromiseRef.current; // 100 characters define a location chunk, which epub.js uses to approximate pages.
-        }).then((_locations: any) => {
-            const currentLocation = newRendition.currentLocation() as any; // this will be used only once to show the locations
+        newBook.ready.then(async () => {
+            // 1. Try to load saved locations from localforage
+            const savedLocations = await localforage.getItem<string>(bookLocationsKey);
 
-            if (currentLocation) {
+            if (savedLocations) {
+                console.log("Found cached locations, loading instantly...");
+                newBook.locations.load(savedLocations);
+                
+                // Wrap in a resolved promise so locationsPromiseRef.current is "ready" for other functions
+                locationsPromiseRef.current = Promise.resolve(newBook.locations);
+            } else {
+                console.log("No cached locations found. Generating (this might take a while)...");
+                
+                // 2. If not found, generate them normally
+                locationsPromiseRef.current = newBook.locations.generate(100);
+                await locationsPromiseRef.current;
+                
+                // 3. Save the generated locations for next time
+                await localforage.setItem(bookLocationsKey, newBook.locations.save());
+                console.log("Locations generated and cached.");
+            }
+
+            return locationsPromiseRef.current;
+        }).then((_locations: any) => {
+            // This updates the "1 / 500" display immediately after loading/generating
+            const currentLocation = newRendition.currentLocation() as any;
+            if (currentLocation && currentLocation.start.displayed.total) {
                 setPageInfo(`${currentLocation.start.displayed.page} / ${currentLocation.start.displayed.total}`);
             }
         });
@@ -901,11 +928,6 @@ export default function Reader({bookData, onClose}: readerProps) {
         // Cleanup timeout if user types again before 500ms is up
         return () => clearTimeout(delayFn);
     }, [searchQuery]);
-
-
-    // Safely escape regex characters to prevent crashes, and ignore empty queries
-    const highlightQuery = searchQuery.trim();
-    const safeRegex = highlightQuery ? new RegExp(`(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi') : null;
 
 
 
