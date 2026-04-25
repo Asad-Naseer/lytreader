@@ -61,7 +61,10 @@ export default function Reader({bookData, onClose}: readerProps) {
 
     // Sidebar and TOC states
     const [showSidebar, setShowSidebar] = useState<boolean>(false);
-    const [sidebarTab, setSidebarTab] = useState<'toc' | 'highlights'>('toc');
+    const [sidebarTab, setSidebarTab] = useState<'toc' | 'highlights' | 'photos'>('toc');
+    // states for handling photos in sidebarTab
+    const [photosList, setPhotosList] = useState<string[]>([]);
+    const [photosLoading, setPhotosLoading] = useState<boolean>(false);
     const [toc, setToc] = useState<tocItem[]>([]);
 
     // Fontsize states
@@ -547,6 +550,83 @@ export default function Reader({bookData, onClose}: readerProps) {
         }
     }, [showSidebar, sidebarTab, bookHighlightsKey])
 
+    
+// Fetch photos from the epub whenever the Photos tab is opened.
+    useEffect(() => {
+        if (!showSidebar || sidebarTab !== 'photos' || !book) return;
+
+        setPhotosList([]);
+        setPhotosLoading(true);
+
+        let cancelled = false; // guard against stale async runs (StrictMode / fast tab switches)
+
+        const loadPhotos = async () => {
+            try {
+                await book.ready;
+
+                const manifest = book.packaging.manifest;
+
+                const imageItems = (Object.values(manifest) as any[])
+                    .filter(item => typeof item.type === 'string' && item.type.startsWith('image/'))
+                    .sort((a, b) => a.href.localeCompare(b.href, undefined, { numeric: true, sensitivity: 'base' }));
+
+                console.log(`[Photos] ${imageItems.length} images sorted by href`);
+
+                const urls: string[] = [];
+
+                for (const item of imageItems as any[]) {
+                    if (cancelled) break;
+
+                    let url: string | null = null;
+
+                    // Strategy 1: archive.createUrl with resolved (zip-root) path
+                    try {
+                        const resolvedHref = book.path.resolve(item.href);
+                        if (book.archive && typeof book.archive.createUrl === 'function') {
+                            url = await book.archive.createUrl(resolvedHref, { base64: false });
+                        }
+                    } catch (e) {
+                        console.warn("[Photos] archive.createUrl failed for", item.href, e);
+                    }
+
+                    // Strategy 2: book.load() resolves paths internally, returns a Blob
+                    if (!url) {
+                        try {
+                            const blob = await book.load(item.href);
+                            if (blob instanceof Blob) {
+                                url = URL.createObjectURL(blob);
+                            }
+                        } catch (e) {
+                            console.warn("[Photos] book.load failed for", item.href, e);
+                        }
+                    }
+
+                    if (url) urls.push(url);
+                }
+
+                if (!cancelled) {
+                    setPhotosList(urls);
+                }
+
+            } catch (err) {
+                if (!cancelled) {
+                    console.error("[Photos] Fatal error loading photos:", err);
+                    setPhotosList([]);
+                }
+            } finally {
+                if (!cancelled) {
+                    setPhotosLoading(false);
+                }
+            }
+        };
+
+        loadPhotos();
+
+        return () => {
+            cancelled = true; // discard results if effect re-fires before async finishes
+        };
+    }, [showSidebar, sidebarTab, book]);
+
 
 
     // define filtered highlights from highlightsList by using highlightsSearch
@@ -716,6 +796,12 @@ export default function Reader({bookData, onClose}: readerProps) {
                             >
                                 Highlights
                             </button>
+                            <button
+                                className={`flex-1 py-4 font-semibold ${sidebarTab === 'photos' ? 'border-b-4' : 'text-gray-500'}`}
+                                onClick={() => setSidebarTab('photos')}
+                            >
+                                Photos
+                            </button>
                         </div>
 
                         <div className="flex-1 overflow-y-auto">
@@ -725,34 +811,73 @@ export default function Reader({bookData, onClose}: readerProps) {
                                 </div>
                             )}
                             {sidebarTab === 'highlights' && (
-    <div className="flex flex-col h-full overflow-hidden">
-        {/* Scrollable Area */}
-        <div className="flex-1 overflow-y-auto">
-            {renderHighlights()}
-        </div>
+                                <div className="flex flex-col h-full overflow-hidden">
+                                    {/* Scrollable Area */}
+                                    <div className="flex-1 overflow-y-auto">
+                                        {renderHighlights()}
+                                    </div>
 
-        {/* Search Bar at the bottom */}
-        <div className="p-3 border-t border-white/10 bg-[#1c1c1c]">
-            <div className="relative">
-                <input
-                    type="text"
-                    placeholder="Search highlights..."
-                    value={highlightsSearch}
-                    onChange={(e) => setHighlightsSearch(e.target.value)}
-                    className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"
-                />
-                {highlightsSearch && (
-                    <button 
-                        onClick={() => setHighlightsSearch("")}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
-                    >
-                        ✕
-                    </button>
-                )}
-            </div>
-        </div>
-    </div>
-)}
+                                    {/* Search Bar at the bottom */}
+                                    <div className="p-3 border-t border-white/10 bg-[#1c1c1c]">
+                                        <div className="relative">
+                                            <input
+                                                type="text"
+                                                placeholder="Search highlights..."
+                                                value={highlightsSearch}
+                                                onChange={(e) => setHighlightsSearch(e.target.value)}
+                                                className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                                            />
+                                            {highlightsSearch && (
+                                                <button 
+                                                    onClick={() => setHighlightsSearch("")}
+                                                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
+                                                >
+                                                    ✕
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                            {sidebarTab === 'photos' && (
+                                <>
+                                    {photosLoading ? (
+                                        <div className="flex items-center justify-center h-40 text-gray-500 text-sm">
+                                            Loading images...
+                                        </div>
+                                    ) : photosList.length === 0 ? (
+                                        <p className="p-4 text-center text-gray-500 text-sm">
+                                            No images found in this book.
+                                        </p>
+                                    ) : (
+                                        <>
+                                            <p className="text-[10px] text-white/30 uppercase tracking-widest font-semibold text-center py-2 border-b border-white/10">
+                                                {photosList.length} image{photosList.length !== 1 ? 's' : ''}
+                                            </p>
+                                            <div className="grid grid-cols gap-2 p-3">
+                                                {photosList.map((url, index) => (
+                                                    <button
+                                                        key={index}
+                                                        onClick={() => window.open(url, '_blank', 'noopener,noreferrer')}
+                                                        className="aspect-square rounded overflow-hidden bg-white/5 hover:ring-2 hover:ring-blue-500 transition-all"
+                                                    >
+                                                        <img
+                                                            src={url}
+                                                            alt={`Book image ${index + 1}`}
+                                                            className="w-full h-full object-cover"
+                                                            onError={(e) => {
+                                                                // Hide the button if the image breaks
+                                                                const btn = (e.target as HTMLImageElement).closest('button');
+                                                                if (btn) btn.style.display = 'none';
+                                                            }}
+                                                        />
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </>
+                            )}
                         </div>
                     </div>
 
