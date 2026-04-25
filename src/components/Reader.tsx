@@ -1205,10 +1205,10 @@ export default function Reader({bookData, onClose}: readerProps) {
             {/* FOOTER */}
             {showHeaderFooter && (
                 <div className='p-1 flex items-center justify-between border-t relative z-10 bg-[#1c1c1c]'>
-                    <div className="relative w-1/3 pl-4">
+                    <div className="relative w-1/3">
                         <button
                             onClick={() => setShowFontMenu(!showFontMenu)}
-                            className="ml-4 rounded font-bold px-4 py-2 flex items-center justify-center ">
+                            className="rounded font-bold py-2 flex items-center justify-center bg-white-10 px-3">
                             Aa
                         </button>
 
@@ -1254,9 +1254,9 @@ export default function Reader({bookData, onClose}: readerProps) {
         <div className="w-1/3 flex justify-end">
             <button
             onClick={() => { setShowSearch(true); setShowHeaderFooter(false); }}
-            className='rounded py-2 px-3 hover:bg-white/5'
+            className='rounded py-2 px-3 bg-blue-800'
             >
-            Search 🔎
+            🔎
             </button>
         </div>
     </div>
