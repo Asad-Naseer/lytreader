@@ -18,37 +18,13 @@ function App() {
   const [books, setBooks] = useState<Book[]>([]); // books is the state var and setBooks is the setter func.
   const [activeBook, setActiveBook] = useState<Book | null>(null);
 
-
-
-  // Detect Firefox
-  const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
-
-  // --- Updated Fullscreen Logic ---
+  // handle open and close book logic
   const handleOpenBook = (book: Book) => {
     setActiveBook(book);
-    
-    // Only request fullscreen if NOT in Firefox
-    if (!isFirefox) {
-      const docElm = document.documentElement;
-      if (docElm.requestFullscreen) {
-        docElm.requestFullscreen().catch((err) => {
-          console.warn(`Fullscreen skipped: ${err.message}`);
-        });
-      }
-    } else {
-      console.log("Firefox detected: Skipping automatic fullscreen to prevent rendering issues.");
-    }
   };
 
   const handleCloseBook = () => {
     setActiveBook(null);
-
-    // Only attempt to exit fullscreen if NOT in Firefox and we are currently in it
-    if (!isFirefox && document.fullscreenElement) {
-      document.exitFullscreen().catch((err) => {
-        console.warn(`Error exiting fullscreen: ${err.message}`);
-      });
-    }
   };
 
 
