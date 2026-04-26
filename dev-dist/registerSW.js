@@ -1,0 +1,1 @@
+if('serviceWorker' in navigator) navigator.serviceWorker.register('/lytreader/dev-sw.js?dev-sw', { scope: '/lytreader/', type: 'classic' })
