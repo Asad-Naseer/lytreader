@@ -19,6 +19,34 @@ function App() {
   const [activeBook, setActiveBook] = useState<Book | null>(null);
 
 
+
+  // --- NEW: Fullscreen Logic ---
+  const handleOpenBook = (book: Book) => {
+    setActiveBook(book);
+    
+    // Request fullscreen on the whole page (document.documentElement)
+    const docElm = document.documentElement;
+    if (docElm.requestFullscreen) {
+      docElm.requestFullscreen().catch((err) => {
+        console.warn(`Error attempting to enable full-screen mode: ${err.message}`);
+      });
+    }
+  };
+
+  const handleCloseBook = () => {
+    setActiveBook(null);
+
+    // Exit fullscreen if we are currently in it
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch((err) => {
+        console.warn(`Error attempting to exit full-screen mode: ${err.message}`);
+      });
+    }
+  };
+
+
+
+
   // load books that are saved in device storage from indexedDB on initial mount
 
   useEffect(() => {
@@ -63,11 +91,11 @@ function App() {
       {!activeBook ? (
         <>
           <Navigation setBooks={setBooks} />
-          <Shelf books={books} onOpenBook={(book) => setActiveBook(book)} />
+          <Shelf books={books} onOpenBook={handleOpenBook} />
         </>  
       ) : (
         <>
-        <Reader onClose={() => setActiveBook(null)} bookData={activeBook}/>
+        <Reader onClose={handleCloseBook} bookData={activeBook}/>
         </>
       )
 
