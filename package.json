@@ -12,6 +12,7 @@
     "deploy": "gh-pages -d dist"
   },
   "dependencies": {
+    "dropbox": "^10.34.0",
     "epubjs": "^0.3.93",
     "localforage": "^1.10.0",
     "react": "^19.2.0",

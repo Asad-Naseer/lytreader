@@ -20,26 +20,33 @@ function App() {
 
 
 
-  // --- NEW: Fullscreen Logic ---
+  // Detect Firefox
+  const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
+
+  // --- Updated Fullscreen Logic ---
   const handleOpenBook = (book: Book) => {
     setActiveBook(book);
     
-    // Request fullscreen on the whole page (document.documentElement)
-    const docElm = document.documentElement;
-    if (docElm.requestFullscreen) {
-      docElm.requestFullscreen().catch((err) => {
-        console.warn(`Error attempting to enable full-screen mode: ${err.message}`);
-      });
+    // Only request fullscreen if NOT in Firefox
+    if (!isFirefox) {
+      const docElm = document.documentElement;
+      if (docElm.requestFullscreen) {
+        docElm.requestFullscreen().catch((err) => {
+          console.warn(`Fullscreen skipped: ${err.message}`);
+        });
+      }
+    } else {
+      console.log("Firefox detected: Skipping automatic fullscreen to prevent rendering issues.");
     }
   };
 
   const handleCloseBook = () => {
     setActiveBook(null);
 
-    // Exit fullscreen if we are currently in it
-    if (document.fullscreenElement) {
+    // Only attempt to exit fullscreen if NOT in Firefox and we are currently in it
+    if (!isFirefox && document.fullscreenElement) {
       document.exitFullscreen().catch((err) => {
-        console.warn(`Error attempting to exit full-screen mode: ${err.message}`);
+        console.warn(`Error exiting fullscreen: ${err.message}`);
       });
     }
   };
