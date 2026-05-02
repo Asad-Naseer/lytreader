@@ -118,13 +118,16 @@ export default function Reader({bookData, onClose}: readerProps) {
 
         if(!viewerRef.current || !bookData.data) return; // stop execution if either are false/missing
 
+        const isMobile = window.innerWidth < 1000;
+
         // initialize book using the data and epubjs and create and display rendition
         const newBook = ePub(bookData.data);
         setBook(newBook);
         const newRendition = newBook.renderTo(viewerRef.current, {
             width: "100%",
             height: "100%",
-            flow: "scrolled",
+            flow: isMobile? "scrolled" : "paginated",
+            minSpreadWidth: 1000
         }as any)
 
 
@@ -151,9 +154,7 @@ export default function Reader({bookData, onClose}: readerProps) {
                 // "-webkit-user-select": "none",
                 // "user-select": "none",
                 "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
-                "color": "#c2c2c2",
-                "max-width": "1000px !important",
-                "margin": "0 auto !important",
+                "color": "#c2c2c2"
                 // "padding": "0px !important"
             },
             "::selection": {
