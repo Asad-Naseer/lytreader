@@ -136,22 +136,22 @@ export default function Reader({ bookData, onClose }: readerProps) {
       minSpreadWidth: 1000,
     } as any);
 
-    // // disable chrome opening context menu on every click;
-    // newRendition.hooks.content.register((contents: any) => {
-    //   const doc = contents.document;
-    //   const body = doc.body;
+    // disable chrome opening context menu on every click;
+    newRendition.hooks.content.register((contents: any) => {
+      const doc = contents.document;
+      const body = doc.body;
 
-    //   if (body) {
-    //     // Setting tabindex to -1 tricks Chrome into thinking the body is an interactive
-    //     // element, which completely disables the "Touch to Search" / Google Search popup.
-    //     body.setAttribute("tabindex", "-1");
-    //   }
+      if (body) {
+        // Setting tabindex to -1 tricks Chrome into thinking the body is an interactive
+        // element, which completely disables the "Touch to Search" / Google Search popup.
+        body.setAttribute("tabindex", "-1");
+      }
 
-    //   // Prevent the default OS context menu (copy/paste/share) from appearing on long press
-    //   doc.addEventListener("contextmenu", (e: Event) => {
-    //     e.preventDefault();
-    //   });
-    // });
+      // Prevent the default OS context menu (copy/paste/share) from appearing on long press
+      doc.addEventListener("contextmenu", (e: Event) => {
+        e.preventDefault();
+      });
+    });
 
     // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
     newRendition.themes.default({
