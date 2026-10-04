@@ -124,7 +124,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
   useEffect(() => {
     if (!viewerRef.current || !bookData.data) return; // stop execution if either are false/missing
 
-    const isMobile = window.innerWidth < 1000;
+    // const isMobile = window.innerWidth < 1000;
 
     // initialize book using the data and epubjs and create and display rendition
     const newBook = ePub(bookData.data);
@@ -163,7 +163,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
         color: "#c2c2c2",
         "max-width": "1000px !important",
         margin: "0 auto !important",
-        padding: "0 44px !important",
+        padding: "0 10px !important",
         // "box-sizing": "border-box !important",
         // "padding": "0px !important"
       },
