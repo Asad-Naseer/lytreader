@@ -96,9 +96,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
   const highlightQuery = searchQuery.trim();
   const safeRegex = highlightQuery
     ? new RegExp(
-        `(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`,
-        "gi",
-      )
+      `(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`,
+      "gi",
+    )
     : null;
 
   // Fontsize states
@@ -132,8 +132,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
     const newRendition = newBook.renderTo(viewerRef.current, {
       width: "100%",
       height: "100%",
-      flow: isMobile ? "scrolled" : "paginated",
-      minSpreadWidth: 1000,
+      // flow: isMobile ? "scrolled" : "paginated",
+      flow: "scrolled",
+      // minSpreadWidth: 1000,
     } as any);
 
     // disable chrome opening context menu on every click;
@@ -160,6 +161,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
         // "user-select": "none",
         "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
         color: "#c2c2c2",
+        "max-width": "1000px !important",
+        margin: "0 auto !important",
+        padding: "0 44px !important",
+        // "box-sizing": "border-box !important",
         // "padding": "0px !important"
       },
       "::selection": {
@@ -432,6 +437,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
     // only proceed if the highlight has not been finalized yet.
     if (!pendingHighlight.current) return;
 
+    // Clear native browser text selection inside the iframe
+    contents?.window?.getSelection()?.removeAllRanges();
+
     // clear the pendinghighlight (we already have the cfi and contents from it)
     pendingHighlight.current = null;
 
@@ -517,6 +525,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
       // mark the cfi and contents passed to handleSelected as pending highlight & give the text to selectionText
       pendingHighlight.current = { cfi: cfiRange, contents };
       setSelectionText(text);
+      setShowHeaderFooter(true);
     };
 
     rendition.on("selected", handleSelected);
@@ -763,11 +772,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
         <div key={item.id || index}>
           <button
             id={isActive ? "active-toc-item" : undefined}
-            className={`w-full py-3 pr-4 border-b flex justify-between items-center transition-colors text-left ${
-              isActive
-                ? "text-yellow-500 font-bold bg-white/5 border-white/20"
-                : "text-gray-200 hover:bg-white/5 border-white/5"
-            }`}
+            className={`w-full py-3 pr-4 border-b flex justify-between items-center transition-colors text-left ${isActive
+              ? "text-yellow-500 font-bold bg-white/5 border-white/20"
+              : "text-gray-200 hover:bg-white/5 border-white/5"
+              }`}
             style={{ paddingLeft: `${level * 1.5 + 1}rem` }}
             onClick={async () => {
               await rendition.display(item.href);
@@ -798,7 +806,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
       .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "");
 
     // create the google search url
-    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(word + " meaning")}`;
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent("define " + word)}`;
 
     // open in a new tab securely
     window.open(searchUrl, "_blank", "noopener,noreferrer");
@@ -809,6 +817,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
   // func for closing context ui gracefully
   const closeContextUI = () => {
+
+    // Clear selection if cancelled
+    pendingHighlight.current?.contents?.window?.getSelection()?.removeAllRanges();
+
     pendingHighlight.current = null;
     setSelectionText("");
     setShowHeaderFooter(false);
@@ -1062,20 +1074,20 @@ export default function Reader({ bookData, onClose }: readerProps) {
                         <p className="text-sm text-gray-300 italic leading-relaxed">
                           {safeRegex
                             ? (res.excerpt || "")
-                                .split(safeRegex)
-                                .map((part, index) =>
-                                  part.toLowerCase() ===
+                              .split(safeRegex)
+                              .map((part, index) =>
+                                part.toLowerCase() ===
                                   highlightQuery.toLowerCase() ? (
-                                    <mark
-                                      key={index}
-                                      className="bg-yellow-500/40 text-white rounded px-1"
-                                    >
-                                      {part}
-                                    </mark>
-                                  ) : (
-                                    part
-                                  ),
-                                )
+                                  <mark
+                                    key={index}
+                                    className="bg-yellow-500/40 text-white rounded px-1"
+                                  >
+                                    {part}
+                                  </mark>
+                                ) : (
+                                  part
+                                ),
+                              )
                             : res.excerpt}
                         </p>
                       </button>
@@ -1232,7 +1244,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
         {/* THE VIEWER */}
         <div
           ref={viewerRef}
-          className="flex-1 overflow-hidden relative z-0"
+          // className="flex-1 overflow-hidden relative z-0"
+          className="flex-1 overflow-hidden relative z-0 [&_.epub-container]:overflow-x-hidden [&_.epub-container]:[scrollbar-width:none] [&_.epub-container::-webkit-scrollbar]:hidden"
         ></div>
 
         {/* PERSISTENT FOOTER */}
