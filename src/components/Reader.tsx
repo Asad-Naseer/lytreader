@@ -2,6 +2,7 @@ import type { Book } from "../App";
 import { useRef, useState, useEffect } from "react";
 import ePub from "epubjs";
 import localforage from "localforage";
+import { EpubCFI } from "epubjs";
 
 interface readerProps {
   bookData: Book;
@@ -36,6 +37,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const searchIdRef = useRef<number>(0);
+  const [backwardsOnly, setBackwardsOnly] = useState<boolean>(false);
+  const prevSearchQueryRef = useRef<string>("");
 
   // define a ref html div element to pass to epubjs so it can render the book into it
   const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
@@ -104,6 +107,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
   // Fontsize states
   const [fontSize, setFontSize] = useState<number>(100); // percentage
   const [showFontMenu, setShowFontMenu] = useState<boolean>(false);
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
 
   // 1. Load saved font size on initial mount
   useEffect(() => {
@@ -113,6 +117,11 @@ export default function Reader({ bookData, onClose }: readerProps) {
       if (savedFontSize) {
         setFontSize(savedFontSize);
         console.log("saved font size applied", savedFontSize);
+      }
+      const savedTheme =
+        await localforage.getItem<"dark" | "light">("reader-theme");
+      if (savedTheme === "dark" || savedTheme === "light") {
+        setTheme(savedTheme);
       }
     };
     loadSavedSettings();
@@ -168,13 +177,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
         // "padding": "0px !important"
       },
       "::selection": {
-        background: "rgba(255, 255, 0, 0.3)",
+        background: "rgba(59, 130, 246, 0.3)",
       },
-      ".epubjs-hl": {
-        fill: "yellow",
-        "fill-opacity": "0.3",
-        // "mix-blend-mode": "multiply"
-      },
+      // ".epubjs-hl": {
+      //   fill: "#3b82f6",
+      //   "fill-opacity": "0.3",
+      // },
     });
 
     // Get TOC from epubjs
@@ -326,6 +334,29 @@ export default function Reader({ bookData, onClose }: readerProps) {
     }
   }, [fontSize, rendition]);
 
+
+  useEffect(() => {
+    if (!rendition) return;
+
+    const isLight = theme === "light";
+    rendition.themes.override(
+      "background",
+      isLight ? "#fbf5e6" : "#1c1c1c",
+      true,
+    );
+    rendition.themes.override(
+      "color",
+      isLight ? "#2b2b2b" : "#c2c2c2",
+      true,
+    );
+  }, [theme, rendition]);
+
+  const toggleTheme = () => {
+    const nextTheme = theme === "dark" ? "light" : "dark";
+    setTheme(nextTheme);
+    localforage.setItem("reader-theme", nextTheme);
+  };
+
   // SETTING UP NAVIGATION USING keyboard, clicks and swipes
   // use useEffect to check if rendition state is live before setting up navigation controls.
 
@@ -363,8 +394,19 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
     const handleClick = (e: any) => {
       // if a pending highlight is detected, finalize it immediately.
+      // if (pendingHighlight.current) {
+      //   setShowHeaderFooter(true);
+      //   return;
+
+      // Ignore clicks from finishing a drag-selection or double-click
+      const iframeWindow = e.view || e.target?.ownerDocument?.defaultView;
+      if (iframeWindow?.getSelection()?.toString().trim()) { // checks if there is a selection on the iframe window. long drag release will then not cause the contextui to automatically close.
+        return;
+      }
+
+      // if a pending highlight is detected, cancel selection and close bars
       if (pendingHighlight.current) {
-        setShowHeaderFooter(true);
+        closeContextUI();
         return;
       }
 
@@ -445,10 +487,21 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
     // apply to ui , remove first to make sure no duplicates
     rendition.annotations.remove(cfiRange, "highlight");
-    rendition.annotations.add("highlight", cfiRange, {}, (e: MouseEvent) => {
-      setDeleteMenu({ cfi: cfiRange });
-      console.log("Clicked Highlight:", cfiRange, e, contents);
-    });
+    rendition.annotations.add(
+      "highlight",
+      cfiRange,
+      {},
+      (e: MouseEvent) => {
+        setDeleteMenu({ cfi: cfiRange });
+        console.log("Clicked Highlight:", cfiRange, e, contents);
+      },
+      "epubjs-hl",
+      {
+        fill: "#3b82f6",
+        "fill-opacity": "0.3",
+        "mix-blend-mode": "normal",
+      },
+    );
 
     // get the text
     const range = await book.getRange(cfiRange);
@@ -550,14 +603,26 @@ export default function Reader({ bookData, onClose }: readerProps) {
         // remove it if it already exists because render keeps drawing it again whever the chapter loads, this only removes the visual highlight
         rendition.annotations.remove(hl.cfi, "highlight");
 
-        rendition.annotations.add("highlight", hl.cfi, {}, (e: MouseEvent) => {
-          // give deleteMenu state the x and y position of where user clicked and the cfi to delete.
-          setDeleteMenu({
-            cfi: hl.cfi,
-          });
+        rendition.annotations.add(
+          "highlight",
+          hl.cfi,
+          {},
+          (e: MouseEvent) => {
+            // give deleteMenu state the x and y position of where user clicked and the cfi to delete.
+            setDeleteMenu({
+              cfi: hl.cfi,
+            });
+            setShowHeaderFooter(true);
 
-          console.log("clicked highlight: ", hl.cfi, e);
-        });
+            console.log("clicked highlight: ", hl.cfi, e);
+          },
+          "epubjs-hl",
+          {
+            fill: "#3b82f6",
+            "fill-opacity": "0.3",
+            "mix-blend-mode": "normal",
+          },
+        );
       });
 
       console.log(`Applied ${savedHighlights.length} highlights`);
@@ -842,6 +907,13 @@ export default function Reader({ bookData, onClose }: readerProps) {
         await locationsPromiseRef.current;
       }
 
+      const currentLoc =
+        (await rendition?.currentLocation?.()) || rendition?.location;
+      const cutoffCfi = currentLoc?.end?.cfi || currentLoc?.start?.cfi;
+      const currentSpineIndex =
+        currentLoc?.end?.index ?? currentLoc?.start?.index ?? null;
+      const cfiHelper = rendition?.epubcfi || new EpubCFI();
+
       const results: SearchResult[] = [];
       const spineItems = book.spine.spineItems;
 
@@ -849,6 +921,13 @@ export default function Reader({ bookData, onClose }: readerProps) {
         if (currentSearchId !== searchIdRef.current) return;
 
         const item = spineItems[i];
+        if (
+          backwardsOnly &&
+          currentSpineIndex !== null &&
+          (item.index ?? i) > currentSpineIndex
+        ) {
+          break;
+        }
         await item.load(book.load.bind(book));
         const matches = item.find(query);
 
@@ -857,6 +936,17 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
         if (matches && matches.length > 0) {
           for (const match of matches) {
+            if (backwardsOnly && cutoffCfi) {
+              try {
+                const matchCfi = new EpubCFI(match.cfi);
+                matchCfi.collapse(true);
+                if (cfiHelper.compare(matchCfi, cutoffCfi) > 0) {
+                  continue;
+                }
+              } catch {
+                // ignore malformed CFI comparison
+              }
+            }
             let fullExcerpt = match.excerpt;
             try {
               // Resolve the CFI to the actual HTML DOM Nodes inside the chapter
@@ -942,22 +1032,33 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
   // Auto-trigger search when user types (with 500ms debounce)
   useEffect(() => {
+    if (!showSearch) return;
+
+    const queryChanged = prevSearchQueryRef.current !== searchQuery;
+    prevSearchQueryRef.current = searchQuery;
+
     // If the query is cleared, reset everything and kill active searches
     if (!searchQuery.trim()) {
-      searchIdRef.current++; // <--- THIS ABORTS THE BACKGROUND LOOP
+      searchIdRef.current++;
       setSearchResults([]);
       setIsSearching(false);
       return;
     }
 
-    // Wait 500ms before executing the search to prevent freezing while typing
+    // Run immediately when toggling "Backwards only" or reopening search; debounce while typing
+    if (!queryChanged) {
+      executeSearch(searchQuery);
+      return;
+    }
+
     const delayFn = setTimeout(() => {
       executeSearch(searchQuery);
-    }, 500);
+    }, 1000);
 
-    // Cleanup timeout if user types again before 500ms is up
     return () => clearTimeout(delayFn);
-  }, [searchQuery]);
+  }, [searchQuery, backwardsOnly, showSearch]);
+
+  const isLight = theme === "light";
 
   // WHAT THE READER ACTUALLY RENDERS:
 
@@ -966,7 +1067,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
       <div className="flex flex-col absolute w-full h-full top-0 overflow-hidden">
         {/* TOP BAR */}
         {showHeaderFooter && (
-          <div className="absolute bg-[#1c1c1c] top-0 left-0 w-full z-10 flex justify-between items-center p-3 shadow-md">
+          <div
+            className={`absolute top-0 left-0 w-full z-10 flex justify-between items-center p-3 shadow-md ${isLight
+              ? "bg-[#f4ecd8] text-[#2b2b2b] border-b border-black/10"
+              : "bg-[#1c1c1c] text-white"
+              }`}
+          >
             <div className="flex">
               {!pendingHighlight.current ? (
                 <button
@@ -974,7 +1080,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
                     setShowSidebar(true);
                     setShowHeaderFooter(false);
                   }}
-                  className="rounded py-2 px-3 hover:bg-white/5"
+                  className={`rounded py-2 px-3 ${isLight ? "hover:bg-black/5" : "hover:bg-white/5"
+                    }`}
                 >
                   ☰ Menu
                 </button>
@@ -982,7 +1089,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
                 <div className="flex gap-2">
                   <button
                     onClick={handleDictionaryLookup}
-                    className="bg-blue-700 hover:bg-blue-500 px-4 py-2 rounded text-sm flex items-center gap-2"
+                    className="bg-blue-700 hover:bg-blue-500 text-white px-4 py-2 rounded text-sm flex items-center gap-2"
                   >
                     <span>🔎</span>
                   </button>
@@ -992,13 +1099,13 @@ export default function Reader({ bookData, onClose }: readerProps) {
                       finalizeHighlight(cfi, contents);
                       closeContextUI();
                     }}
-                    className="bg-yellow-700 hover:bg-yellow-500 px-4 py-2 rounded text-sm font-medium"
+                    className="bg-yellow-700 hover:bg-yellow-500 text-white px-4 py-2 rounded text-sm font-medium"
                   >
                     ✏️
                   </button>
                   <button
                     onClick={closeContextUI}
-                    className="px-4 py-2 text-sm rounded bg-[#e24741]"
+                    className="px-4 py-2 text-sm rounded bg-[#e24741] text-white"
                   >
                     Cancel
                   </button>
@@ -1009,7 +1116,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
             {deleteMenu && (
               <button
                 onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
-                className="bg-[#e24741] hover:bg-red-700 py-1.5 px-3 rounded transition-colors text-sm"
+                className="bg-[#e24741] hover:bg-red-700 text-white py-1.5 px-3 rounded transition-colors text-sm"
               >
                 Delete Highlight
               </button>
@@ -1017,7 +1124,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
             <button
               onClick={onClose}
-              className="bg-[#e24741] hover:bg-red-600 rounded px-4 py-2 pointer transition-colors font-medium"
+              className="bg-[#e24741] hover:bg-red-600 text-white rounded px-4 py-2 pointer transition-colors font-medium"
             >
               Close
             </button>
@@ -1042,7 +1149,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
               </div>
 
               {/* Search Input Area */}
-              <div className="p-4 border-b border-white/10 bg-white/5">
+              <div className="p-4 border-b border-white/10 bg-white/5 flex flex-col gap-3">
                 <input
                   type="text"
                   placeholder="Start typing to search..."
@@ -1050,6 +1157,27 @@ export default function Reader({ bookData, onClose }: readerProps) {
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="w-full bg-[#121212] border border-white/20 rounded-md px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors text-white placeholder-gray-500"
                 />
+
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={backwardsOnly}
+                  onClick={() => setBackwardsOnly((prev) => !prev)}
+                  className="w-full flex items-center justify-between cursor-pointer select-none"
+                >
+                  <span className="text-xs text-gray-300 font-medium">
+                    Backwards only
+                  </span>
+                  <span
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${backwardsOnly ? "bg-blue-600" : "bg-white/20"
+                      }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${backwardsOnly ? "translate-x-5" : "translate-x-0.5"
+                        }`}
+                    />
+                  </span>
+                </button>
               </div>
 
               {/* Search Results Area */}
@@ -1245,14 +1373,19 @@ export default function Reader({ bookData, onClose }: readerProps) {
         <div
           ref={viewerRef}
           // className="flex-1 overflow-hidden relative z-0"
-          className="flex-1 overflow-hidden relative z-0 [&_.epub-container]:overflow-x-hidden [&_.epub-container]:[scrollbar-width:none] [&_.epub-container::-webkit-scrollbar]:hidden"
+          className={`flex-1 overflow-hidden relative z-0 [&_.epub-container]:overflow-x-hidden [&_.epub-container]:[scrollbar-width:none] [&_.epub-container::-webkit-scrollbar]:hidden ${theme === "light" ? "bg-[#fbf5e6]" : "bg-[#1c1c1c]"
+            }`}
         ></div>
 
         {/* PERSISTENT FOOTER */}
         {!showHeaderFooter && !showSidebar && (
-          <div className="h-6 w-full shrink-0 flex items-center justify-between px-4 text-[10px] text-white/40 uppercase tracking-widest font-semibold bg-[#1c1c1c] relative z-10">
-            <div className="flex-1">{pageInfo}</div>{" "}
-            {/* Empty space for left balance */}
+          <div
+            className={`h-6 w-full shrink-0 flex items-center justify-between px-4 text-[10px] uppercase tracking-widest font-semibold relative z-10 ${isLight
+              ? "bg-[#fbf5e6] text-black/45"
+              : "bg-[#1c1c1c] text-white/40"
+              }`}
+          >
+            <div className="flex-1">{pageInfo}</div>
             <div className="flex-1 text-center truncate px-2">
               {currentChapter}
             </div>
@@ -1262,31 +1395,67 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
         {/* FOOTER */}
         {showHeaderFooter && (
-          <div className="p-1 flex items-center justify-between border-t relative z-10 bg-[#1c1c1c]">
+          <div
+            className={`p-1 flex items-center justify-between border-t relative z-10 ${isLight
+              ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
+              : "bg-[#1c1c1c] text-white border-white/15"
+              }`}
+          >
             <div className="relative w-1/3">
               <button
                 onClick={() => setShowFontMenu(!showFontMenu)}
-                className="rounded font-bold py-2 flex items-center justify-center bg-white-10 px-3"
+                className={`rounded font-bold py-2 px-3 flex items-center justify-center transition-colors ${isLight
+                  ? "bg-black/5 hover:bg-black/10"
+                  : "bg-white/10 hover:bg-white/20"
+                  }`}
               >
                 Aa
               </button>
 
               {showFontMenu && (
-                <div className="absolute bottom-full left-0 mb-3 bg-[#1c1c1c] p-2 rounded shadow-lg border flex items-center gap-3">
+                <div
+                  className={`absolute bottom-full left-0 mb-3 p-2.5 rounded-lg shadow-xl border flex flex-col gap-2 min-w-[140px] ${isLight
+                    ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
+                    : "bg-[#1c1c1c] text-white border-white/15"
+                    }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <button
+                      onClick={() => setFontSize((f) => Math.max(50, f - 10))}
+                      className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
+                        ? "bg-black/5 hover:bg-black/10"
+                        : "bg-white/10 hover:bg-white/20"
+                        }`}
+                    >
+                      -
+                    </button>
+                    <span className="w-12 text-center text-sm font-medium">
+                      {fontSize}%
+                    </span>
+                    <button
+                      onClick={() => setFontSize((f) => Math.min(300, f + 10))}
+                      className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
+                        ? "bg-black/5 hover:bg-black/10"
+                        : "bg-white/10 hover:bg-white/20"
+                        }`}
+                    >
+                      +
+                    </button>
+                  </div>
+
+                  <div
+                    className={`border-t ${isLight ? "border-black/10" : "border-white/10"
+                      }`}
+                  />
+
                   <button
-                    onClick={() => setFontSize((f) => Math.max(50, f - 10))}
-                    className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center"
+                    onClick={toggleTheme}
+                    className={`w-full py-1.5 px-3 rounded text-sm font-medium transition-colors whitespace-nowrap ${isLight
+                      ? "bg-black/5 hover:bg-black/10"
+                      : "bg-white/10 hover:bg-white/20"
+                      }`}
                   >
-                    -
-                  </button>
-                  <span className="w-12 text-center font-medium">
-                    {fontSize}%
-                  </span>
-                  <button
-                    onClick={() => setFontSize((f) => Math.min(300, f + 10))}
-                    className="w-8 h-8 rounded font-bold text-xl flex items-center justify-center"
-                  >
-                    +
+                    {theme === "dark" ? "Light mode" : "Dark mode"}
                   </button>
                 </div>
               )}
@@ -1296,31 +1465,40 @@ export default function Reader({ bookData, onClose }: readerProps) {
             <div className="flex items-center gap-6">
               <button
                 onClick={() => rendition?.prev()}
-                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 active:bg-white/70"
+                className={`flex items-center justify-center rounded px-3 py-1 ${isLight
+                  ? "bg-black/10 active:bg-black/25"
+                  : "bg-white/20 active:bg-white/70"
+                  }`}
               >
                 ‹
               </button>
 
-              <div className="text-center text-[11px] flex uppercase whitespace-nowrap text-gray-400 font-medium">
+              <div
+                className={`text-center text-[11px] flex uppercase whitespace-nowrap font-medium ${isLight ? "text-black/60" : "text-gray-400"
+                  }`}
+              >
                 {pageInfo}
               </div>
 
               <button
                 onClick={() => rendition?.next()}
-                className="flex items-center justify-center rounded px-3 py-1 bg-white/20 active:bg-white/70"
+                className={`flex items-center justify-center rounded px-3 py-1 ${isLight
+                  ? "bg-black/10 active:bg-black/25"
+                  : "bg-white/20 active:bg-white/70"
+                  }`}
               >
                 ›
               </button>
             </div>
 
-            {/* Right Side: Spacer to keep center balanced */}
+            {/* Right Side */}
             <div className="w-1/3 flex justify-end">
               <button
                 onClick={() => {
                   setShowSearch(true);
                   setShowHeaderFooter(false);
                 }}
-                className="rounded py-2 px-3 bg-blue-800"
+                className="rounded py-2 px-3 bg-blue-800 text-white"
               >
                 🔎
               </button>
