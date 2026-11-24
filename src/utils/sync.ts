@@ -26,6 +26,8 @@ export interface SyncHighlight {
 
 export interface SyncBookState {
   name?: string;
+  addedAt?: number;
+  lastOpenedAt?: number;
   progress?: {
     cfi: string;
     updatedAt: number;
@@ -48,9 +50,13 @@ export interface CloudData {
   version: 1;
   settings: SyncSettings;
   books: Record<string, SyncBookState>;
+  deletedBooks?: Record<string, number>;
 }
 
 interface LocalSyncMeta {
+  bookAddedAt: Record<string, number>;
+  bookLastOpenedAt: Record<string, number>;
+  deletedBooks: Record<string, number>;
   progressUpdatedAt: Record<string, number>;
   deletedHighlights: Record<string, Record<string, number>>;
   fontSizeUpdatedAt: number;
@@ -68,22 +74,20 @@ interface StoredHighlightItem {
 export interface SyncResult {
   uploadedBooksCount: number;
   downloadedBooks: Book[];
+  deletedFromCloudCount: number;
+  deletedBookIds: string[];
   metadataChanged: boolean;
 }
-
-const DEFAULT_META: LocalSyncMeta = {
-  progressUpdatedAt: {},
-  deletedHighlights: {},
-  fontSizeUpdatedAt: 0,
-  themeUpdatedAt: 0,
-};
 
 // Serialize local sync-meta updates so rapid scrolled `relocated` events never race
 let metaWriteQueue: Promise<void> = Promise.resolve();
 
 const getSyncMeta = async (): Promise<LocalSyncMeta> => {
-  const saved = await localforage.getItem<LocalSyncMeta>(SYNC_META_KEY);
+  const saved = await localforage.getItem<Partial<LocalSyncMeta>>(SYNC_META_KEY);
   return {
+    bookAddedAt: { ...(saved?.bookAddedAt ?? {}) },
+    bookLastOpenedAt: { ...(saved?.bookLastOpenedAt ?? {}) },
+    deletedBooks: { ...(saved?.deletedBooks ?? {}) },
     progressUpdatedAt: { ...(saved?.progressUpdatedAt ?? {}) },
     deletedHighlights: { ...(saved?.deletedHighlights ?? {}) },
     fontSizeUpdatedAt: saved?.fontSizeUpdatedAt ?? 0,
@@ -102,6 +106,66 @@ const updateSyncMeta = (updater: (meta: LocalSyncMeta) => void): Promise<void> =
       console.error("Failed to update sync metadata:", err);
     });
   return metaWriteQueue;
+};
+
+export const touchBookAddedMeta = (bookId: string): Promise<void> => {
+  const now = Date.now();
+  return updateSyncMeta((meta) => {
+    meta.bookAddedAt[bookId] = now;
+    delete meta.deletedBooks[bookId];
+  });
+};
+
+export const touchBookLastOpenedMeta = (bookId: string): Promise<void> => {
+  const now = Date.now();
+  return updateSyncMeta((meta) => {
+    meta.bookLastOpenedAt[bookId] = now;
+  });
+};
+
+export const getBookSortTimestamps = async (): Promise<
+  Record<string, number>
+> => {
+  await metaWriteQueue;
+  const meta = await getSyncMeta();
+  const timestamps: Record<string, number> = {};
+  const ids = new Set([
+    ...Object.keys(meta.bookAddedAt),
+    ...Object.keys(meta.bookLastOpenedAt),
+  ]);
+  for (const id of ids) {
+    timestamps[id] = meta.bookLastOpenedAt[id] || meta.bookAddedAt[id] || 0;
+  }
+  return timestamps;
+};
+
+export const sortBooksList = (
+  books: Book[],
+  timestamps: Record<string, number>,
+): Book[] => {
+  return [...books].sort((a, b) => {
+    const diff = (timestamps[b.id] ?? 0) - (timestamps[a.id] ?? 0);
+    if (diff !== 0) return diff;
+    return a.name.localeCompare(b.name);
+  });
+};
+
+export const deleteBookLocally = async (bookId: string): Promise<void> => {
+  await Promise.all([
+    localforage.removeItem(bookId),
+    localforage.removeItem(`progress-${bookId}`),
+    localforage.removeItem(`highlights-${bookId}`),
+    localforage.removeItem(`locations-${bookId}`),
+  ]);
+
+  const now = Date.now();
+  await updateSyncMeta((meta) => {
+    meta.deletedBooks[bookId] = now;
+    delete meta.bookAddedAt[bookId];
+    delete meta.bookLastOpenedAt[bookId];
+    delete meta.progressUpdatedAt[bookId];
+    delete meta.deletedHighlights[bookId];
+  });
 };
 
 export const touchProgressMeta = (bookId: string): Promise<void> => {
@@ -257,10 +321,22 @@ const buildLocalCloudData = async (): Promise<{
     ...Object.keys(localProgress),
     ...Object.keys(localHighlights),
     ...Object.keys(meta.deletedHighlights),
+    ...Object.keys(meta.deletedBooks),
   ]);
 
   const books: Record<string, SyncBookState> = {};
+  const deletedBooks: Record<string, number> = {};
+
   for (const id of Array.from(bookIds).sort()) {
+    const addedAt = meta.bookAddedAt[id] ?? 0;
+    const lastOpenedAt = meta.bookLastOpenedAt[id] ?? 0;
+    const deletedAt = meta.deletedBooks[id];
+
+    if (deletedAt !== undefined && (!localBooks[id] || deletedAt >= addedAt)) {
+      deletedBooks[id] = deletedAt;
+      continue;
+    }
+
     const hlMap = new Map<string, SyncHighlight>();
     for (const hl of localHighlights[id] ?? []) {
       hlMap.set(hl.cfi, {
@@ -273,14 +349,14 @@ const buildLocalCloudData = async (): Promise<{
     }
 
     const deletedMap = meta.deletedHighlights[id] ?? {};
-    for (const [cfi, deletedAt] of Object.entries(deletedMap)) {
+    for (const [cfi, hlDeletedAt] of Object.entries(deletedMap)) {
       const existing = hlMap.get(cfi);
-      if (!existing || deletedAt >= existing.createdAt) {
+      if (!existing || hlDeletedAt >= existing.createdAt) {
         hlMap.set(cfi, {
           cfi,
           text: "",
           createdAt: existing?.createdAt ?? 0,
-          deletedAt,
+          deletedAt: hlDeletedAt,
         });
       }
     }
@@ -294,6 +370,8 @@ const buildLocalCloudData = async (): Promise<{
 
     books[id] = {
       ...(bookName ? { name: bookName } : {}),
+      ...(addedAt > 0 ? { addedAt } : {}),
+      ...(lastOpenedAt > 0 ? { lastOpenedAt } : {}),
       ...(progressCfi
         ? {
             progress: {
@@ -325,6 +403,7 @@ const buildLocalCloudData = async (): Promise<{
       version: 1,
       settings,
       books,
+      ...(Object.keys(deletedBooks).length > 0 ? { deletedBooks } : {}),
     },
     localBooks,
     localProgress,
@@ -368,14 +447,33 @@ const mergeCloudData = (
   }
 
   const allBookIds = Array.from(
-    new Set([...Object.keys(local.books), ...Object.keys(remote.books ?? {})]),
+    new Set([
+      ...Object.keys(local.books),
+      ...Object.keys(remote.books ?? {}),
+      ...Object.keys(local.deletedBooks ?? {}),
+      ...Object.keys(remote.deletedBooks ?? {}),
+    ]),
   ).sort();
 
   const mergedBooks: Record<string, SyncBookState> = {};
+  const mergedDeletedBooks: Record<string, number> = {};
 
   for (const id of allBookIds) {
     const lBook = local.books[id];
     const rBook = remote.books?.[id];
+    const lBookDel = local.deletedBooks?.[id] ?? -1;
+    const rBookDel = remote.deletedBooks?.[id] ?? -1;
+    const maxBookDel = Math.max(lBookDel, rBookDel);
+    const maxAddedAt = Math.max(lBook?.addedAt ?? 0, rBook?.addedAt ?? 0);
+    const maxLastOpenedAt = Math.max(
+      lBook?.lastOpenedAt ?? 0,
+      rBook?.lastOpenedAt ?? 0,
+    );
+
+    if (maxBookDel >= 0 && maxBookDel >= maxAddedAt) {
+      mergedDeletedBooks[id] = maxBookDel;
+      continue;
+    }
 
     const name = rBook?.name || lBook?.name;
 
@@ -444,6 +542,8 @@ const mergeCloudData = (
 
     mergedBooks[id] = {
       ...(name ? { name } : {}),
+      ...(maxAddedAt > 0 ? { addedAt: maxAddedAt } : {}),
+      ...(maxLastOpenedAt > 0 ? { lastOpenedAt: maxLastOpenedAt } : {}),
       ...(progress ? { progress } : {}),
       highlights: mergedHighlights,
     };
@@ -453,6 +553,9 @@ const mergeCloudData = (
     version: 1,
     settings,
     books: mergedBooks,
+    ...(Object.keys(mergedDeletedBooks).length > 0
+      ? { deletedBooks: mergedDeletedBooks }
+      : {}),
   };
 };
 
@@ -477,9 +580,12 @@ const downloadCloudData = async (
 const applyMergedStateLocally = async (
   merged: CloudData,
   localState: Awaited<ReturnType<typeof buildLocalCloudData>>,
-) => {
+): Promise<string[]> => {
   const newMeta: LocalSyncMeta = {
-    progressUpdatedAt: { ...DEFAULT_META.progressUpdatedAt },
+    bookAddedAt: {},
+    bookLastOpenedAt: {},
+    deletedBooks: { ...(merged.deletedBooks ?? {}) },
+    progressUpdatedAt: {},
     deletedHighlights: {},
     fontSizeUpdatedAt: merged.settings.fontSize?.updatedAt ?? 0,
     themeUpdatedAt: merged.settings.theme?.updatedAt ?? 0,
@@ -499,7 +605,33 @@ const applyMergedStateLocally = async (
     await localforage.setItem("reader-theme", merged.settings.theme.value);
   }
 
+  const deletedBookIds: string[] = [];
+  for (const bookId of Object.keys(merged.deletedBooks ?? {})) {
+    const hadBook = Boolean(localState.localBooks[bookId]);
+    const hadProgress = Boolean(localState.localProgress[bookId]);
+    const hadHighlights = Boolean(localState.localHighlights[bookId]);
+
+    if (hadBook || hadProgress || hadHighlights) {
+      await Promise.all([
+        localforage.removeItem(bookId),
+        localforage.removeItem(`progress-${bookId}`),
+        localforage.removeItem(`highlights-${bookId}`),
+        localforage.removeItem(`locations-${bookId}`),
+      ]);
+    }
+    if (hadBook) {
+      deletedBookIds.push(bookId);
+    }
+  }
+
   for (const [bookId, bookState] of Object.entries(merged.books)) {
+    if (bookState.addedAt && bookState.addedAt > 0) {
+      newMeta.bookAddedAt[bookId] = bookState.addedAt;
+    }
+    if (bookState.lastOpenedAt && bookState.lastOpenedAt > 0) {
+      newMeta.bookLastOpenedAt[bookId] = bookState.lastOpenedAt;
+    }
+
     if (bookState.progress) {
       newMeta.progressUpdatedAt[bookId] = bookState.progress.updatedAt;
       if (bookState.progress.cfi !== localState.localProgress[bookId]) {
@@ -537,11 +669,13 @@ const applyMergedStateLocally = async (
   }
 
   await localforage.setItem(SYNC_META_KEY, newMeta);
+  return deletedBookIds;
 };
 
 const syncMetadataFile = async (dbx: Dropbox): Promise<{
   mergedData: CloudData;
   localBooks: Record<string, Book>;
+  deletedBookIds: string[];
   metadataChanged: boolean;
 }> => {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -549,7 +683,7 @@ const syncMetadataFile = async (dbx: Dropbox): Promise<{
     const { data: remoteData, rev: remoteRev } = await downloadCloudData(dbx);
     const mergedData = mergeCloudData(localState.localData, remoteData);
 
-    await applyMergedStateLocally(mergedData, localState);
+    const deletedBookIds = await applyMergedStateLocally(mergedData, localState);
 
     const cloudNeedsUpdate =
       !remoteData || !canonicalEqual(mergedData, remoteData);
@@ -558,6 +692,7 @@ const syncMetadataFile = async (dbx: Dropbox): Promise<{
       return {
         mergedData,
         localBooks: localState.localBooks,
+        deletedBookIds,
         metadataChanged: !canonicalEqual(localState.localData, mergedData),
       };
     }
@@ -578,6 +713,7 @@ const syncMetadataFile = async (dbx: Dropbox): Promise<{
       return {
         mergedData,
         localBooks: localState.localBooks,
+        deletedBookIds,
         metadataChanged: true,
       };
     } catch (err) {
@@ -621,6 +757,21 @@ const listRemoteBooks = async (
   }
 
   return entries;
+};
+
+const deleteRemoteBookBinary = async (
+  dbx: Dropbox,
+  path: string,
+): Promise<boolean> => {
+  try {
+    await dbx.filesDeleteV2({ path });
+    return true;
+  } catch (err) {
+    if (isDropboxNotFoundError(err)) {
+      return false;
+    }
+    return handleAuthFailureIfAny(err);
+  }
 };
 
 const uploadBookBinary = async (
@@ -717,8 +868,9 @@ const extractBookDetails = async (
 export const syncWithDropbox = async (): Promise<SyncResult> => {
   const dbx = await getDropboxClient();
 
-  // 1. Merge tiny data.json first (highlights, reading positions, settings)
-  const { mergedData, localBooks, metadataChanged } = await syncMetadataFile(dbx);
+  // 1. Merge tiny data.json first (highlights, reading positions, order, settings, deletions)
+  const { mergedData, localBooks, deletedBookIds, metadataChanged } =
+    await syncMetadataFile(dbx);
 
   // 2. Compare /lytreader/books/ against local books
   const remoteBookEntries = await listRemoteBooks(dbx);
@@ -729,9 +881,24 @@ export const syncWithDropbox = async (): Promise<SyncResult> => {
     remoteByBookId.set(bookId, entry);
   }
 
-  // Upload any local books missing from Dropbox
+  // 2a. Delete any books from Dropbox that were deleted on any device
+  let deletedFromCloudCount = 0;
+  for (const bookId of Object.keys(mergedData.deletedBooks ?? {})) {
+    const entry = remoteByBookId.get(bookId);
+    if (entry) {
+      const removed = await deleteRemoteBookBinary(
+        dbx,
+        entry.path_lower || `${DROPBOX_BOOKS_DIR}/${entry.name}`,
+      );
+      if (removed) deletedFromCloudCount++;
+      remoteByBookId.delete(bookId);
+    }
+  }
+
+  // 2b. Upload any local books missing from Dropbox (skipping deleted ones)
   let uploadedBooksCount = 0;
   for (const [bookId, book] of Object.entries(localBooks)) {
+    if (mergedData.deletedBooks?.[bookId]) continue;
     if (!remoteByBookId.has(bookId)) {
       await uploadBookBinary(
         dbx,
@@ -742,9 +909,10 @@ export const syncWithDropbox = async (): Promise<SyncResult> => {
     }
   }
 
-  // Download any Dropbox books missing locally
+  // 2c. Download any Dropbox books missing locally
   const downloadedBooks: Book[] = [];
   for (const [bookId, entry] of remoteByBookId.entries()) {
+    if (mergedData.deletedBooks?.[bookId]) continue;
     if (!localBooks[bookId]) {
       try {
         const res = await dbx.filesDownload({
@@ -773,6 +941,8 @@ export const syncWithDropbox = async (): Promise<SyncResult> => {
   return {
     uploadedBooksCount,
     downloadedBooks,
+    deletedFromCloudCount,
+    deletedBookIds,
     metadataChanged,
   };
 };

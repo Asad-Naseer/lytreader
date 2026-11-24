@@ -8,7 +8,12 @@ import {
   disconnectDropbox,
   DropboxAuthError,
 } from "../utils/dropbox";
-import { syncWithDropbox } from "../utils/sync";
+import {
+  syncWithDropbox,
+  touchBookAddedMeta,
+  getBookSortTimestamps,
+  sortBooksList,
+} from "../utils/sync";
 import type { Book } from "../App";
 
 const computeBookId = async (
@@ -117,12 +122,16 @@ function Navigation({ setBooks }: { setBooks: Function }) {
           data: arrayBuffer,
         };
         await localforage.setItem(bookId, newBookObj);
+        await touchBookAddedMeta(bookId);
         newBooks.push(newBookObj);
       } catch (error) {
         console.error(error);
       }
     }
-    if (newBooks.length > 0) setBooks((prev: Book[]) => [...prev, ...newBooks]);
+    if (newBooks.length > 0) {
+      const timestamps = await getBookSortTimestamps();
+      setBooks((prev: Book[]) => sortBooksList([...prev, ...newBooks], timestamps));
+    }
     if (fileInputRef.current) fileInputRef.current.value = "";
     if (folderInputRef.current) folderInputRef.current.value = "";
   };
@@ -169,13 +178,20 @@ function Navigation({ setBooks }: { setBooks: Function }) {
     try {
       const result = await syncWithDropbox();
 
-      if (result.downloadedBooks.length > 0) {
+      if (
+        result.downloadedBooks.length > 0 ||
+        result.deletedBookIds.length > 0 ||
+        result.metadataChanged
+      ) {
+        const timestamps = await getBookSortTimestamps();
+        const deletedSet = new Set(result.deletedBookIds);
         setBooks((prev: Book[]) => {
-          const existingIds = new Set(prev.map((b) => b.id));
+          const remaining = prev.filter((b) => !deletedSet.has(b.id));
+          const existingIds = new Set(remaining.map((b) => b.id));
           const additions = result.downloadedBooks.filter(
             (b) => !existingIds.has(b.id),
           );
-          return [...prev, ...additions];
+          return sortBooksList([...remaining, ...additions], timestamps);
         });
       }
 
@@ -185,6 +201,12 @@ function Navigation({ setBooks }: { setBooks: Function }) {
       }
       if (result.downloadedBooks.length > 0) {
         parts.push(`↓ ${result.downloadedBooks.length} book(s) downloaded`);
+      }
+      if (result.deletedFromCloudCount > 0) {
+        parts.push(`${result.deletedFromCloudCount} book(s) deleted from cloud`);
+      }
+      if (result.deletedBookIds.length > 0) {
+        parts.push(`${result.deletedBookIds.length} book(s) removed locally`);
       }
       if (result.metadataChanged) {
         parts.push("progress & highlights synced");
