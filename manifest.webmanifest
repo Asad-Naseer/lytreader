@@ -1,0 +1,1 @@
+{"name":"LytReader","short_name":"LytReader","description":"Offline EPUB reader.","start_url":"/lytreader/","display":"standalone","background_color":"#1c1c1c","theme_color":"#1c1c1c","lang":"en","scope":"/lytreader/","icons":[{"src":"pwa-192x192.png","sizes":"192x192","type":"image/png"},{"src":"pwa-512x512.png","sizes":"512x512","type":"image/png"}]}
