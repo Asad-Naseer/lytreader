@@ -864,8 +864,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
           <button
             id={isActive ? "active-toc-item" : undefined}
             className={`w-full py-3 pr-4 border-b flex justify-between items-center transition-colors text-left ${isActive
-                ? "text-yellow-500 font-bold bg-white/5 border-white/20"
-                : "text-gray-200 hover:bg-white/5 border-white/5"
+              ? "text-yellow-500 font-bold bg-white/5 border-white/20"
+              : "text-gray-200 hover:bg-white/5 border-white/5"
               }`}
             style={{ paddingLeft: `${level * 1.5 + 1}rem` }}
             onClick={async () => {
@@ -1120,8 +1120,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
         {showHeaderFooter && (
           <div
             className={`absolute top-0 left-0 w-full z-10 flex justify-between items-center p-3 shadow-md ${isLight
-                ? "bg-[#f4ecd8] text-[#2b2b2b] border-b border-black/10"
-                : "bg-[#1c1c1c] text-white"
+              ? "bg-[#f4ecd8] text-[#2b2b2b] border-b border-black/10"
+              : "bg-[#1c1c1c] text-white"
               }`}
           >
             <div className="flex">
@@ -1382,13 +1382,13 @@ export default function Reader({ bookData, onClose }: readerProps) {
                           {photosList.map((url, index) => (
                             <button
                               key={index}
-                              onClick={() =>
-                                window.open(
-                                  url,
-                                  "_blank",
-                                  "noopener,noreferrer",
-                                )
-                              }
+                              onClick={() => {
+                                lookupCfiRef.current =
+                                  rendition?.currentLocation?.()?.start?.cfi ||
+                                  rendition?.location?.start?.cfi ||
+                                  null;
+                                window.open(url, "_blank", "noopener,noreferrer");
+                              }}
                               className="aspect-square rounded overflow-hidden bg-white/5 hover:ring-2 hover:ring-blue-500 transition-all"
                             >
                               <img
@@ -1432,8 +1432,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
         {!showHeaderFooter && !showSidebar && (
           <div
             className={`h-6 w-full shrink-0 flex items-center justify-between px-4 text-[10px] uppercase tracking-widest font-semibold relative z-10 ${isLight
-                ? "bg-[#fbf5e6] text-black/45"
-                : "bg-[#1c1c1c] text-white/40"
+              ? "bg-[#fbf5e6] text-black/45"
+              : "bg-[#1c1c1c] text-white/40"
               }`}
           >
             <div className="flex-1">{pageInfo}</div>
@@ -1448,16 +1448,16 @@ export default function Reader({ bookData, onClose }: readerProps) {
         {showHeaderFooter && (
           <div
             className={`p-1 flex items-center justify-between border-t relative z-10 ${isLight
-                ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
-                : "bg-[#1c1c1c] text-white border-white/15"
+              ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
+              : "bg-[#1c1c1c] text-white border-white/15"
               }`}
           >
             <div className="relative w-1/3">
               <button
                 onClick={() => setShowFontMenu(!showFontMenu)}
                 className={`rounded font-bold py-2 px-3 flex items-center justify-center transition-colors ${isLight
-                    ? "bg-black/5 hover:bg-black/10"
-                    : "bg-white/10 hover:bg-white/20"
+                  ? "bg-black/5 hover:bg-black/10"
+                  : "bg-white/10 hover:bg-white/20"
                   }`}
               >
                 Aa
@@ -1466,8 +1466,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
               {showFontMenu && (
                 <div
                   className={`absolute bottom-full left-0 mb-3 p-2.5 rounded-lg shadow-xl border flex flex-col gap-2 min-w-[140px] ${isLight
-                      ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
-                      : "bg-[#1c1c1c] text-white border-white/15"
+                    ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
+                    : "bg-[#1c1c1c] text-white border-white/15"
                     }`}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -1477,8 +1477,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
                         touchSettingsMeta("fontSize");
                       }}
                       className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
-                          ? "bg-black/5 hover:bg-black/10"
-                          : "bg-white/10 hover:bg-white/20"
+                        ? "bg-black/5 hover:bg-black/10"
+                        : "bg-white/10 hover:bg-white/20"
                         }`}
                     >
                       -
@@ -1492,8 +1492,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
                         touchSettingsMeta("fontSize");
                       }}
                       className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
-                          ? "bg-black/5 hover:bg-black/10"
-                          : "bg-white/10 hover:bg-white/20"
+                        ? "bg-black/5 hover:bg-black/10"
+                        : "bg-white/10 hover:bg-white/20"
                         }`}
                     >
                       +
@@ -1508,8 +1508,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
                   <button
                     onClick={toggleTheme}
                     className={`w-full py-1.5 px-3 rounded text-sm font-medium transition-colors whitespace-nowrap ${isLight
-                        ? "bg-black/5 hover:bg-black/10"
-                        : "bg-white/10 hover:bg-white/20"
+                      ? "bg-black/5 hover:bg-black/10"
+                      : "bg-white/10 hover:bg-white/20"
                       }`}
                   >
                     {theme === "dark" ? "Light mode" : "Dark mode"}
@@ -1523,8 +1523,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
               <button
                 onClick={() => rendition?.prev()}
                 className={`flex items-center justify-center rounded px-3 py-1 ${isLight
-                    ? "bg-black/10 active:bg-black/25"
-                    : "bg-white/20 active:bg-white/70"
+                  ? "bg-black/10 active:bg-black/25"
+                  : "bg-white/20 active:bg-white/70"
                   }`}
               >
                 ‹
@@ -1540,8 +1540,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
               <button
                 onClick={() => rendition?.next()}
                 className={`flex items-center justify-center rounded px-3 py-1 ${isLight
-                    ? "bg-black/10 active:bg-black/25"
-                    : "bg-white/20 active:bg-white/70"
+                  ? "bg-black/10 active:bg-black/25"
+                  : "bg-white/20 active:bg-white/70"
                   }`}
               >
                 ›
