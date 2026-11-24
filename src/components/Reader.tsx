@@ -3,6 +3,12 @@ import { useRef, useState, useEffect } from "react";
 import ePub from "epubjs";
 import localforage from "localforage";
 import { EpubCFI } from "epubjs";
+import {
+  touchProgressMeta,
+  recordHighlightTombstone,
+  clearHighlightTombstone,
+  touchSettingsMeta,
+} from "../utils/sync";
 
 interface readerProps {
   bookData: Book;
@@ -21,6 +27,7 @@ interface highlightItem {
   text: string;
   chapter?: string;
   percentage?: number;
+  createdAt?: number;
 }
 
 interface SearchResult {
@@ -32,6 +39,7 @@ interface SearchResult {
 
 export default function Reader({ bookData, onClose }: readerProps) {
   // Global book search states
+  const lookupCfiRef = useRef<string | null>(null);
   const [showSearch, setShowSearch] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -190,18 +198,23 @@ export default function Reader({ bookData, onClose }: readerProps) {
       setToc(nav.toc);
     });
 
+    let lastKnownCfi: string | null = null;
+    let hasCompletedInitialDisplay = false;
+
     // actually display the rendition and check for stored book positions
     const loadSavedPositions = async () => {
       const savedCfi = await localforage.getItem<string>(
         `progress-${bookData.id}`,
       );
+      lastKnownCfi = savedCfi;
       if (savedCfi) {
         await newRendition.display(savedCfi);
         await newRendition.display(savedCfi);
         console.log("Saved cfi displayed,", savedCfi);
       } else {
-        newRendition.display();
+        await newRendition.display();
       }
+      hasCompletedInitialDisplay = true;
     };
 
     loadSavedPositions();
@@ -251,6 +264,15 @@ export default function Reader({ bookData, onClose }: readerProps) {
       // Save position to browser indexedDB via localforage
       localforage.setItem(`progress-${bookData.id}`, location.start.cfi);
       console.log("cfi saved", location.start.cfi);
+
+      if (!hasCompletedInitialDisplay) {
+        if (!lastKnownCfi) {
+          lastKnownCfi = location.start.cfi;
+        }
+      } else if (location.start.cfi !== lastKnownCfi) {
+        lastKnownCfi = location.start.cfi;
+        touchProgressMeta(bookData.id);
+      }
 
       if (location.start.displayed.total) {
         // check if epubjs has already calculated total pages
@@ -334,7 +356,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
     }
   }, [fontSize, rendition]);
 
-
   useEffect(() => {
     if (!rendition) return;
 
@@ -355,6 +376,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
     const nextTheme = theme === "dark" ? "light" : "dark";
     setTheme(nextTheme);
     localforage.setItem("reader-theme", nextTheme);
+    touchSettingsMeta("theme");
   };
 
   // SETTING UP NAVIGATION USING keyboard, clicks and swipes
@@ -564,8 +586,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
         text: text,
         chapter,
         percentage,
+        createdAt: Date.now(),
       });
       await localforage.setItem(bookHighlightsKey, existingHighlights);
+      await clearHighlightTombstone(bookData.id, cfiRange);
     }
   };
 
@@ -650,6 +674,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
       (await localforage.getItem(bookHighlightsKey)) || [];
     const updatedHighlights = existingHighlights.filter((h) => h.cfi !== cfi);
     await localforage.setItem(bookHighlightsKey, updatedHighlights);
+    await recordHighlightTombstone(bookData.id, cfi);
 
     // close the menu
     setDeleteMenu(null);
@@ -874,6 +899,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
     // create the google search url
     const searchUrl = `https://www.google.com/search?q=${encodeURIComponent("define " + word)}`;
 
+    // save current position before opening the tab
+    lookupCfiRef.current =
+      rendition?.currentLocation?.()?.start?.cfi ||
+      rendition?.location?.start?.cfi ||
+      null;
+
     // open in a new tab securely
     window.open(searchUrl, "_blank", "noopener,noreferrer");
 
@@ -881,9 +912,28 @@ export default function Reader({ bookData, onClose }: readerProps) {
     closeContextUI();
   };
 
+  useEffect(() => {
+    if (!rendition) return;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible" && lookupCfiRef.current) {
+        const cfi = lookupCfiRef.current;
+        lookupCfiRef.current = null;
+        setTimeout(async () => {
+          await rendition.display(cfi);
+          await rendition.display(cfi);
+        }, 250);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [rendition]);
+
   // func for closing context ui gracefully
   const closeContextUI = () => {
-
     // Clear selection if cancelled
     pendingHighlight.current?.contents?.window?.getSelection()?.removeAllRanges();
 
@@ -1332,13 +1382,13 @@ export default function Reader({ bookData, onClose }: readerProps) {
                           {photosList.map((url, index) => (
                             <button
                               key={index}
-                              onClick={() =>
-                                window.open(
-                                  url,
-                                  "_blank",
-                                  "noopener,noreferrer",
-                                )
-                              }
+                              onClick={() => {
+                                lookupCfiRef.current =
+                                  rendition?.currentLocation?.()?.start?.cfi ||
+                                  rendition?.location?.start?.cfi ||
+                                  null;
+                                window.open(url, "_blank", "noopener,noreferrer");
+                              }}
                               className="aspect-square rounded overflow-hidden bg-white/5 hover:ring-2 hover:ring-blue-500 transition-all"
                             >
                               <img
@@ -1422,7 +1472,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
                 >
                   <div className="flex items-center justify-between gap-2">
                     <button
-                      onClick={() => setFontSize((f) => Math.max(50, f - 10))}
+                      onClick={() => {
+                        setFontSize((f) => Math.max(50, f - 10));
+                        touchSettingsMeta("fontSize");
+                      }}
                       className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
                         ? "bg-black/5 hover:bg-black/10"
                         : "bg-white/10 hover:bg-white/20"
@@ -1434,7 +1487,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
                       {fontSize}%
                     </span>
                     <button
-                      onClick={() => setFontSize((f) => Math.min(300, f + 10))}
+                      onClick={() => {
+                        setFontSize((f) => Math.min(300, f + 10));
+                        touchSettingsMeta("fontSize");
+                      }}
                       className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
                         ? "bg-black/5 hover:bg-black/10"
                         : "bg-white/10 hover:bg-white/20"

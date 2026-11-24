@@ -5,6 +5,12 @@ import Shelf from "./components/Shelf.tsx";
 import { useEffect } from "react";
 import Reader from "./components/Reader.tsx";
 import localforage from "localforage";
+import {
+  deleteBookLocally,
+  touchBookLastOpenedMeta,
+  getBookSortTimestamps,
+  sortBooksList,
+} from "./utils/sync";
 
 export type Book = {
   id: string;
@@ -20,10 +26,18 @@ function App() {
   // handle open and close book logic
   const handleOpenBook = (book: Book) => {
     setActiveBook(book);
+    void touchBookLastOpenedMeta(book.id);
+    setBooks((prev) => [book, ...prev.filter((b) => b.id !== book.id)]);
   };
 
   const handleCloseBook = () => {
     setActiveBook(null);
+  };
+
+  const handleDeleteBook = async (book: Book) => {
+    if (!confirm(`Delete "${book.name}" from your library?`)) return;
+    await deleteBookLocally(book.id);
+    setBooks((prev) => prev.filter((b) => b.id !== book.id));
   };
 
   // load books that are saved in device storage from indexedDB on initial mount
@@ -36,14 +50,15 @@ function App() {
         // filter the books
         const bookKeys = keys.filter((key) => key.startsWith("book-"));
 
-        // fetch all books that are in indexedDB
-        const savedBooks = await Promise.all(
+        // fetch all books that are in indexedDB + sort timestamps
+        const [savedBooks, timestamps] = await Promise.all([
           // we need to use Promise.all here because localforage returns a promise for each key. React state expects real data not promises. Promise.all waits until all promises are resolved.
-          bookKeys.map((key) => localforage.getItem<Book>(key)),
-        );
+          Promise.all(bookKeys.map((key) => localforage.getItem<Book>(key))),
+          getBookSortTimestamps(),
+        ]);
 
-        // Filter out any null values
-        setBooks(savedBooks.filter(Boolean) as Book[]);
+        // Filter out any null values and sort by last opened
+        setBooks(sortBooksList(savedBooks.filter(Boolean) as Book[], timestamps));
       } catch (error) {
         console.error("Failed to load books from storage:", error);
       }
@@ -65,7 +80,11 @@ function App() {
       {!activeBook ? (
         <>
           <Navigation setBooks={setBooks} />
-          <Shelf books={books} onOpenBook={handleOpenBook} />
+          <Shelf
+            books={books}
+            onOpenBook={handleOpenBook}
+            onDeleteBook={handleDeleteBook}
+          />
         </>
       ) : (
         <>

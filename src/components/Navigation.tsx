@@ -3,24 +3,50 @@ import localforage from "localforage";
 import ePub from "epubjs";
 import { bufferToBase64, base64ToBuffer } from "../utils/backup";
 import {
-  uploadToDropbox,
-  downloadFromDropbox,
-  getAccessToken,
+  initDropboxAuth,
   startDropboxAuth,
+  disconnectDropbox,
+  DropboxAuthError,
 } from "../utils/dropbox";
+import {
+  syncWithDropbox,
+  touchBookAddedMeta,
+  getBookSortTimestamps,
+  sortBooksList,
+} from "../utils/sync";
 import type { Book } from "../App";
+
+const computeBookId = async (
+  file: File,
+  arrayBuffer: ArrayBuffer,
+): Promise<string> => {
+  if (globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
+    const hex = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return `book-${hex.slice(0, 24)}`;
+  }
+  const safeName = file.name.replace(/[\\/:*?"<>|]/g, "_");
+  return `book-${safeName}-${file.size}`;
+};
 
 function Navigation({ setBooks }: { setBooks: Function }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const restoreInputRef = useRef<HTMLInputElement>(null);
 
-  const [isToCloudLoading, setIsToCloudLoading] = useState(false);
-  const [isFromCloudLoading, setIsFromCloudLoading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [isLoggedInDropbox, setIsLoggedInDropbox] = useState(false);
 
   useEffect(() => {
-    if (getAccessToken()) setIsLoggedInDropbox(true);
+    let active = true;
+    initDropboxAuth().then((connected) => {
+      if (active) setIsLoggedInDropbox(connected);
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const gatherAllData = async () => {
@@ -43,28 +69,52 @@ function Navigation({ setBooks }: { setBooks: Function }) {
   ) => {
     const files = event.target.files;
     if (!files) return;
+
+    const existingKeys = await localforage.keys();
+    const existingBooks = (
+      await Promise.all(
+        existingKeys
+          .filter((k) => k.startsWith("book-"))
+          .map((k) => localforage.getItem<Book>(k)),
+      )
+    ).filter(Boolean) as Book[];
+
     const newBooks: Book[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       if (!file.name.toLowerCase().endsWith(".epub")) continue;
-      const bookId = `book-${file.name}-${file.size}-${file.lastModified}`;
-      const existingBook = await localforage.getItem(bookId);
-      if (existingBook) continue;
       try {
         const arrayBuffer = await file.arrayBuffer();
-        const book = await ePub(arrayBuffer);
-        const coverUrl = await book.coverUrl();
+        const bookId = await computeBookId(file, arrayBuffer);
+
+        const alreadyExists =
+          existingBooks.some(
+            (b) =>
+              b.id === bookId ||
+              (b.name === file.name &&
+                b.data?.byteLength === arrayBuffer.byteLength),
+          ) || newBooks.some((b) => b.id === bookId);
+
+        if (alreadyExists) continue;
+
+        const book = ePub(arrayBuffer);
         let permanentCover = "";
-        if (coverUrl) {
-          const response = await fetch(coverUrl);
-          const blob = await response.blob();
-          permanentCover = await new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result as string);
-            reader.readAsDataURL(blob);
-          });
-          URL.revokeObjectURL(coverUrl);
+        try {
+          const coverUrl = await book.coverUrl();
+          if (coverUrl) {
+            const response = await fetch(coverUrl);
+            const blob = await response.blob();
+            permanentCover = await new Promise((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result as string);
+              reader.readAsDataURL(blob);
+            });
+            URL.revokeObjectURL(coverUrl);
+          }
+        } finally {
+          book.destroy();
         }
+
         const newBookObj: Book = {
           id: bookId,
           name: file.name,
@@ -72,12 +122,16 @@ function Navigation({ setBooks }: { setBooks: Function }) {
           data: arrayBuffer,
         };
         await localforage.setItem(bookId, newBookObj);
+        await touchBookAddedMeta(bookId);
         newBooks.push(newBookObj);
       } catch (error) {
         console.error(error);
       }
     }
-    if (newBooks.length > 0) setBooks((prev: Book[]) => [...prev, ...newBooks]);
+    if (newBooks.length > 0) {
+      const timestamps = await getBookSortTimestamps();
+      setBooks((prev: Book[]) => sortBooksList([...prev, ...newBooks], timestamps));
+    }
     if (fileInputRef.current) fileInputRef.current.value = "";
     if (folderInputRef.current) folderInputRef.current.value = "";
   };
@@ -119,33 +173,63 @@ function Navigation({ setBooks }: { setBooks: Function }) {
     reader.readAsText(file);
   };
 
-  const handleSyncToCloud = async () => {
-    setIsToCloudLoading(true);
-    const data = await gatherAllData();
-    const success = await uploadToDropbox(data);
-    setIsToCloudLoading(false);
-    if (success) alert("Saved to Cloud!");
+  const handleSyncDropbox = async () => {
+    setIsSyncing(true);
+    try {
+      const result = await syncWithDropbox();
+
+      if (
+        result.downloadedBooks.length > 0 ||
+        result.deletedBookIds.length > 0 ||
+        result.metadataChanged
+      ) {
+        const timestamps = await getBookSortTimestamps();
+        const deletedSet = new Set(result.deletedBookIds);
+        setBooks((prev: Book[]) => {
+          const remaining = prev.filter((b) => !deletedSet.has(b.id));
+          const existingIds = new Set(remaining.map((b) => b.id));
+          const additions = result.downloadedBooks.filter(
+            (b) => !existingIds.has(b.id),
+          );
+          return sortBooksList([...remaining, ...additions], timestamps);
+        });
+      }
+
+      const parts: string[] = [];
+      if (result.uploadedBooksCount > 0) {
+        parts.push(`↑ ${result.uploadedBooksCount} book(s) uploaded`);
+      }
+      if (result.downloadedBooks.length > 0) {
+        parts.push(`↓ ${result.downloadedBooks.length} book(s) downloaded`);
+      }
+      if (result.deletedFromCloudCount > 0) {
+        parts.push(`${result.deletedFromCloudCount} book(s) deleted from cloud`);
+      }
+      if (result.deletedBookIds.length > 0) {
+        parts.push(`${result.deletedBookIds.length} book(s) removed locally`);
+      }
+      if (result.metadataChanged) {
+        parts.push("progress & highlights synced");
+      }
+
+      alert(parts.length > 0 ? `Synced! (${parts.join(", ")})` : "Already up to date!");
+    } catch (error) {
+      if (error instanceof DropboxAuthError) {
+        setIsLoggedInDropbox(false);
+        alert(error.message);
+      } else {
+        console.error("Dropbox sync error:", error);
+        alert("Sync failed. Please check your connection and try again.");
+      }
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
-  const handleSyncFromCloud = async () => {
-    if (!confirm("Overwrite current library with Cloud data?")) return;
-    setIsFromCloudLoading(true);
-    const json = await downloadFromDropbox();
-    if (json) {
-      await localforage.clear();
-      for (const [key, value] of Object.entries(json)) {
-        let dataToSave = value;
-        if (key.startsWith("book-") && value && typeof value === "object") {
-          const bookValue = value as any;
-          dataToSave = { ...bookValue, data: base64ToBuffer(bookValue.data) };
-        }
-        await localforage.setItem(key, dataToSave);
-      }
-      window.location.reload();
-    } else {
-      alert("Cloud backup not found.");
-    }
-    setIsFromCloudLoading(false);
+  const handleDisconnectDropbox = async () => {
+    if (!confirm("Disconnect Dropbox from this device?")) return;
+    await disconnectDropbox();
+    setIsLoggedInDropbox(false);
   };
 
   return (
@@ -205,18 +289,18 @@ function Navigation({ setBooks }: { setBooks: Function }) {
           ) : (
             <div className="flex items-center justify-center gap-2 w-full sm:w-auto">
               <button
-                disabled={isToCloudLoading || isFromCloudLoading}
+                disabled={isSyncing}
                 className="flex-1 sm:flex-none bg-indigo-700 hover:bg-indigo-600 white bn pointer pv2 ph3 br2 transition-colors text-xs font-bold uppercase tracking-tight min-w-[120px] whitespace-nowrap"
-                onClick={handleSyncToCloud}
+                onClick={handleSyncDropbox}
               >
-                {isToCloudLoading ? "⏳..." : "☁️ Sync To Cloud"}
+                {isSyncing ? "⏳ Syncing..." : "☁️ Sync"}
               </button>
               <button
-                disabled={isToCloudLoading || isFromCloudLoading}
-                className="flex-1 sm:flex-none bg-teal-700 hover:bg-teal-600 white bn pointer pv2 ph3 br2 transition-colors text-xs font-bold uppercase tracking-tight min-w-[140px] whitespace-nowrap"
-                onClick={handleSyncFromCloud}
+                disabled={isSyncing}
+                className="bg-white/10 hover:bg-white/20 text-gray-300 bn pointer pv2 ph3 br2 transition-colors text-xs font-bold uppercase tracking-tight whitespace-nowrap"
+                onClick={handleDisconnectDropbox}
               >
-                {isFromCloudLoading ? "⏳..." : "☁️ Sync From Cloud"}
+                Disconnect
               </button>
             </div>
           )}
