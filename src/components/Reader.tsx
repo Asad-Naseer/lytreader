@@ -514,6 +514,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
       {},
       (e: MouseEvent) => {
         setDeleteMenu({ cfi: cfiRange });
+        setShowHeaderFooter(true);
         console.log("Clicked Highlight:", cfiRange, e, contents);
       },
       "epubjs-hl",
