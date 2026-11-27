@@ -1,5 +1,5 @@
 import type { Book } from "../App";
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState, useEffect, useLayoutEffect } from "react";
 import ePub from "epubjs";
 import localforage from "localforage";
 import { EpubCFI } from "epubjs";
@@ -40,6 +40,9 @@ interface SearchResult {
 export default function Reader({ bookData, onClose }: readerProps) {
   // Global book search states
   const lookupCfiRef = useRef<string | null>(null);
+  const overlayCfiRef = useRef<string | null>(null);
+  const restoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const overlayInputFocusedRef = useRef<boolean>(false);
   const [showSearch, setShowSearch] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -50,12 +53,24 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
   // define a ref html div element to pass to epubjs so it can render the book into it
   const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
+  const readerContainerRef = useRef<HTMLDivElement>(null);
+  const contextCardRef = useRef<HTMLDivElement>(null);
+  const [contextCardAnchor, setContextCardAnchor] = useState<{
+    x: number;
+    top: number;
+    bottom: number;
+  } | null>(null);
+  const [contextCardCoords, setContextCardCoords] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
 
   // define a promise ref for generation of locations
   const locationsPromiseRef = useRef<Promise<any> | null>(null);
 
   // define pending highlight var to check for when highlights start and deciding when to finalize them
   const pendingHighlight = useRef<{ cfi: string; contents: any } | null>(null);
+  const lastTapViewportRef = useRef<{ x: number; y: number } | null>(null);
 
   // define selection text for dictionary lookup
   const [selectionText, setSelectionText] = useState<string>("");
@@ -160,15 +175,50 @@ export default function Reader({ bookData, onClose }: readerProps) {
       const body = doc.body;
 
       if (body) {
-        // Setting tabindex to -1 tricks Chrome into thinking the body is an interactive
-        // element, which completely disables the "Touch to Search" / Google Search popup.
+        // tabindex=-1 suppresses tap-to-search; contenteditable + inputmode=none makes Chrome treat
+        // text selection as an editable region (suppressing the selection Touch-to-Search bar)
+        // without opening the virtual keyboard.
         body.setAttribute("tabindex", "-1");
+        body.setAttribute("contenteditable", "true");
+        body.setAttribute("inputmode", "none");
+        body.setAttribute("spellcheck", "false");
+        body.setAttribute("data-reader-content", "true");
       }
 
-      // Prevent the default OS context menu (copy/paste/share) from appearing on long press
-      doc.addEventListener("contextmenu", (e: Event) => {
+      const preventDefault = (e: Event) => {
         e.preventDefault();
+      };
+      // Keep the book read-only while contenteditable is enabled
+      doc.addEventListener("beforeinput", preventDefault);
+      doc.addEventListener("paste", preventDefault);
+      doc.addEventListener("cut", preventDefault);
+      doc.addEventListener("drop", preventDefault);
+      // Prevent the default OS context menu (copy/paste/share) from appearing on long press
+      doc.addEventListener("contextmenu", preventDefault);
+
+      // Record real viewport tap coordinates before marks-pane clones the event (which strips clientX/clientY)
+      const recordTapCoords = (e: MouseEvent | TouchEvent) => {
+        const touch =
+          "touches" in e && e.touches?.length
+            ? e.touches[0]
+            : "changedTouches" in e && e.changedTouches?.length
+              ? e.changedTouches[0]
+              : null;
+        const cx = touch ? touch.clientX : (e as MouseEvent).clientX;
+        const cy = touch ? touch.clientY : (e as MouseEvent).clientY;
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+        const iframeRect =
+          doc.defaultView?.frameElement?.getBoundingClientRect();
+        lastTapViewportRef.current = {
+          x: (iframeRect?.left ?? 0) + cx,
+          y: (iframeRect?.top ?? 0) + cy,
+        };
+      };
+      doc.addEventListener("touchstart", recordTapCoords, {
+        capture: true,
+        passive: true,
       });
+      doc.addEventListener("mousedown", recordTapCoords, true);
     });
 
     // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
@@ -177,6 +227,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
         // "-webkit-user-select": "none",
         // "user-select": "none",
         "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
+        "caret-color": "transparent",
+        outline: "none",
         color: "#c2c2c2",
         "max-width": "1000px !important",
         margin: "0 auto !important",
@@ -391,7 +443,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
       if (
         target.tagName === "INPUT" ||
         target.tagName === "TEXTAREA" ||
-        target.isContentEditable
+        (target.isContentEditable && !target.closest?.("[data-reader-content]"))
       ) {
         return; // Exit the function and do nothing if the user is typing
       }
@@ -426,6 +478,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
         return;
       }
 
+      // Clear any collapsed caret from tapping the contenteditable body
+      iframeWindow?.getSelection()?.removeAllRanges();
+      (iframeWindow?.document?.activeElement as HTMLElement | null)?.blur?.();
+
       // if a pending highlight is detected, cancel selection and close bars
       if (pendingHighlight.current) {
         closeContextUI();
@@ -434,6 +490,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
       // disappear delete and font menu when user clicks somewhere that is not the delete button
       setDeleteMenu(null);
+      setContextCardAnchor(null);
       setShowFontMenu(false);
 
       // get the width of the viewer
@@ -494,6 +551,105 @@ export default function Reader({ bookData, onClose }: readerProps) {
     };
   }, [rendition]);
 
+  const getCardAnchorFromRect = (
+    rect: DOMRect | null | undefined,
+    iframeEl: Element | null | undefined,
+  ): { x: number; top: number; bottom: number } | null => {
+    const container = readerContainerRef.current;
+    if (!container || !rect) return null;
+
+    const containerRect = container.getBoundingClientRect();
+    const iframeRect = iframeEl?.getBoundingClientRect();
+    const offsetX = iframeRect ? iframeRect.left : 0;
+    const offsetY = iframeRect ? iframeRect.top : 0;
+
+    return {
+      x: offsetX + rect.left + rect.width / 2 - containerRect.left,
+      top: offsetY + rect.top - containerRect.top,
+      bottom: offsetY + rect.bottom - containerRect.top,
+    };
+  };
+
+  const getCardAnchorFromPoint = (
+    clientX: number,
+    clientY: number,
+    iframeEl: Element | null | undefined,
+  ): { x: number; top: number; bottom: number } | null => {
+    const container = readerContainerRef.current;
+    if (!container) return null;
+
+    const containerRect = container.getBoundingClientRect();
+    const iframeRect = iframeEl?.getBoundingClientRect();
+    const x = (iframeRect ? iframeRect.left : 0) + clientX - containerRect.left;
+    const y = (iframeRect ? iframeRect.top : 0) + clientY - containerRect.top;
+
+    return { x, top: y, bottom: y };
+  };
+
+  const attachHighlightAnnotation = (targetRendition: any, cfi: string) => {
+    targetRendition.annotations.remove(cfi, "highlight");
+    targetRendition.annotations.add(
+      "highlight",
+      cfi,
+      {},
+      (e: MouseEvent | TouchEvent) => {
+        const targetEl = e.target as Element | null;
+        // marks-pane SVG highlights live in the parent document, so frameElement is null when already in viewport coords
+        const iframeEl = targetEl?.ownerDocument?.defaultView?.frameElement;
+        const rect = targetEl?.getBoundingClientRect?.();
+        const childRects = Array.from(
+          targetEl?.querySelectorAll?.("rect") ?? [],
+        )
+          .map((r) => r.getBoundingClientRect())
+          .filter((r) => r.width > 0 || r.height > 0);
+
+        // Prefer real captured tap coordinates because marks-pane's clone(e) drops clientX/clientY to 0
+        const tap = lastTapViewportRef.current;
+        const matchedRect =
+          tap && childRects.length > 0
+            ? childRects.find(
+                (r) =>
+                  tap.x >= r.left - 8 &&
+                  tap.x <= r.right + 8 &&
+                  tap.y >= r.top - 8 &&
+                  tap.y <= r.bottom + 8,
+              )
+            : null;
+
+        const effectiveRect =
+          matchedRect ||
+          (rect && (rect.width > 0 || rect.height > 0) ? rect : childRects[0]);
+
+        const rectAnchor = effectiveRect
+          ? getCardAnchorFromRect(effectiveRect, iframeEl)
+          : null;
+        const tapAnchor = tap
+          ? getCardAnchorFromPoint(tap.x, tap.y, null)
+          : null;
+
+        const anchor =
+          rectAnchor && tapAnchor && matchedRect
+            ? { x: tapAnchor.x, top: rectAnchor.top, bottom: rectAnchor.bottom }
+            : rectAnchor || tapAnchor;
+
+        pendingHighlight.current?.contents?.window
+          ?.getSelection()
+          ?.removeAllRanges();
+        pendingHighlight.current = null;
+        setSelectionText("");
+        setDeleteMenu({ cfi });
+        setContextCardAnchor(anchor);
+        setShowHeaderFooter(true);
+      },
+      "epubjs-hl",
+      {
+        fill: "#3b82f6",
+        "fill-opacity": "0.3",
+        "mix-blend-mode": "normal",
+      },
+    );
+  };
+
   // make finalizeHighlight function to call automatically after 5 seconds of inactivity after highlighting something
   const finalizeHighlight = async (cfiRange: string, contents: any) => {
     if (!rendition || !book || !pendingHighlight.current) return;
@@ -508,23 +664,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
     pendingHighlight.current = null;
 
     // apply to ui , remove first to make sure no duplicates
-    rendition.annotations.remove(cfiRange, "highlight");
-    rendition.annotations.add(
-      "highlight",
-      cfiRange,
-      {},
-      (e: MouseEvent) => {
-        setDeleteMenu({ cfi: cfiRange });
-        setShowHeaderFooter(true);
-        console.log("Clicked Highlight:", cfiRange, e, contents);
-      },
-      "epubjs-hl",
-      {
-        fill: "#3b82f6",
-        "fill-opacity": "0.3",
-        "mix-blend-mode": "normal",
-      },
-    );
+    attachHighlightAnnotation(rendition, cfiRange);
 
     // get the text
     const range = await book.getRange(cfiRange);
@@ -599,10 +739,17 @@ export default function Reader({ bookData, onClose }: readerProps) {
     const handleSelected = (cfiRange: string, contents: any) => {
       const range = rendition.getRange(cfiRange);
       const text = range.toString().trim();
+      const rect =
+        range?.getBoundingClientRect?.() || range?.getClientRects?.()?.[0];
+      const iframeEl =
+        contents?.window?.frameElement ||
+        viewerRef.current?.querySelector("iframe");
 
       // mark the cfi and contents passed to handleSelected as pending highlight & give the text to selectionText
+      setDeleteMenu(null);
       pendingHighlight.current = { cfi: cfiRange, contents };
       setSelectionText(text);
+      setContextCardAnchor(getCardAnchorFromRect(rect, iframeEl));
       setShowHeaderFooter(true);
     };
 
@@ -625,29 +772,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
       // loop through the highlights and apply them
       savedHighlights.forEach((hl) => {
-        // remove it if it already exists because render keeps drawing it again whever the chapter loads, this only removes the visual highlight
-        rendition.annotations.remove(hl.cfi, "highlight");
-
-        rendition.annotations.add(
-          "highlight",
-          hl.cfi,
-          {},
-          (e: MouseEvent) => {
-            // give deleteMenu state the x and y position of where user clicked and the cfi to delete.
-            setDeleteMenu({
-              cfi: hl.cfi,
-            });
-            setShowHeaderFooter(true);
-
-            console.log("clicked highlight: ", hl.cfi, e);
-          },
-          "epubjs-hl",
-          {
-            fill: "#3b82f6",
-            "fill-opacity": "0.3",
-            "mix-blend-mode": "normal",
-          },
-        );
+        attachHighlightAnnotation(rendition, hl.cfi);
       });
 
       console.log(`Applied ${savedHighlights.length} highlights`);
@@ -678,6 +803,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
     // close the menu
     setDeleteMenu(null);
+    setContextCardAnchor(null);
   };
 
   // Auto-scroll to the active chapter when the TOC sidebar is opened
@@ -832,9 +958,14 @@ export default function Reader({ bookData, onClose }: readerProps) {
           key={item.cfi || index}
           className="text-left w-full py-3 px-4 border-b"
           onClick={async () => {
-            await rendition.display(item.cfi);
-            await rendition.display(item.cfi); // double for hack, to display the proper position.
+            const hadInputFocus = overlayInputFocusedRef.current;
+            overlayCfiRef.current = null;
+            overlayInputFocusedRef.current = false;
             setShowSidebar(false);
+            await displayCfi(item.cfi);
+            if (hadInputFocus) {
+              scheduleCfiRestore(item.cfi);
+            }
           }}
         >
           {/* Chapter and Percentage Header */}
@@ -869,6 +1000,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
               }`}
             style={{ paddingLeft: `${level * 1.5 + 1}rem` }}
             onClick={async () => {
+              overlayCfiRef.current = null;
+              overlayInputFocusedRef.current = false;
               await rendition.display(item.href);
               setShowSidebar(false);
               setShowHeaderFooter(false);
@@ -887,6 +1020,47 @@ export default function Reader({ bookData, onClose }: readerProps) {
     });
   };
 
+  const getCurrentCfi = (): string | null =>
+    rendition?.currentLocation?.()?.start?.cfi ||
+    rendition?.location?.start?.cfi ||
+    null;
+
+  const displayCfi = async (cfi: string) => {
+    if (!rendition) return;
+    await rendition.display(cfi);
+    await rendition.display(cfi); // double execution hack so scrolled flow lands on exact position
+  };
+
+  const scheduleCfiRestore = (cfi: string | null) => {
+    if (!cfi || !rendition) return;
+    if (restoreTimerRef.current) {
+      clearTimeout(restoreTimerRef.current);
+    }
+    restoreTimerRef.current = setTimeout(() => {
+      restoreTimerRef.current = null;
+      displayCfi(cfi);
+    }, 250);
+  };
+
+  const openOverlayWithCfi = (setOverlayOpen: (open: boolean) => void) => {
+    if (restoreTimerRef.current) {
+      clearTimeout(restoreTimerRef.current);
+      restoreTimerRef.current = null;
+    }
+    overlayCfiRef.current = getCurrentCfi();
+    overlayInputFocusedRef.current = false;
+    setOverlayOpen(true);
+    setShowHeaderFooter(false);
+  };
+
+  const closeOverlayAndRestore = (setOverlayOpen: (open: boolean) => void) => {
+    const cfi = overlayCfiRef.current;
+    overlayCfiRef.current = null;
+    overlayInputFocusedRef.current = false;
+    setOverlayOpen(false);
+    scheduleCfiRestore(cfi);
+  };
+
   // func for opening a Google search in a new tab
   const handleDictionaryLookup = () => {
     if (!selectionText) return;
@@ -900,10 +1074,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
     const searchUrl = `https://www.google.com/search?q=${encodeURIComponent("define " + word)}`;
 
     // save current position before opening the tab
-    lookupCfiRef.current =
-      rendition?.currentLocation?.()?.start?.cfi ||
-      rendition?.location?.start?.cfi ||
-      null;
+    lookupCfiRef.current = getCurrentCfi();
 
     // open in a new tab securely
     window.open(searchUrl, "_blank", "noopener,noreferrer");
@@ -919,16 +1090,17 @@ export default function Reader({ bookData, onClose }: readerProps) {
       if (document.visibilityState === "visible" && lookupCfiRef.current) {
         const cfi = lookupCfiRef.current;
         lookupCfiRef.current = null;
-        setTimeout(async () => {
-          await rendition.display(cfi);
-          await rendition.display(cfi);
-        }, 250);
+        scheduleCfiRestore(cfi);
       }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (restoreTimerRef.current) {
+        clearTimeout(restoreTimerRef.current);
+        restoreTimerRef.current = null;
+      }
     };
   }, [rendition]);
 
@@ -939,8 +1111,61 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
     pendingHighlight.current = null;
     setSelectionText("");
+    setContextCardAnchor(null);
     setShowHeaderFooter(false);
   };
+
+  const handleFinalizePendingHighlight = () => {
+    if (!pendingHighlight.current) return;
+    const { cfi, contents } = pendingHighlight.current;
+    finalizeHighlight(cfi, contents);
+    closeContextUI();
+  };
+
+  const handleSearchSelection = () => {
+    const selected = selectionText.replace(/\s+/g, " ").trim();
+    openOverlayWithCfi(setShowSearch);
+    if (selected) {
+      prevSearchQueryRef.current = selected;
+      setSearchQuery(selected);
+      closeContextUI();
+    }
+  };
+
+  useLayoutEffect(() => {
+    const container = readerContainerRef.current;
+    const card = contextCardRef.current;
+    if (!contextCardAnchor || !container || !card) {
+      setContextCardCoords(null);
+      return;
+    }
+
+    const cardWidth = card.offsetWidth;
+    const cardHeight = card.offsetHeight;
+    const containerWidth = container.clientWidth;
+    const containerHeight = container.clientHeight;
+
+    const minTop = showHeaderFooter ? 68 : 12;
+    const maxTop = Math.max(
+      minTop,
+      containerHeight - cardHeight - (showHeaderFooter ? 64 : 32),
+    );
+
+    const left = Math.max(
+      8,
+      Math.min(
+        contextCardAnchor.x - cardWidth / 2,
+        containerWidth - cardWidth - 8,
+      ),
+    );
+
+    const aboveTop = contextCardAnchor.top - cardHeight - 10;
+    const belowTop = contextCardAnchor.bottom + 14;
+    const preferredTop = aboveTop >= minTop ? aboveTop : belowTop;
+    const top = Math.max(minTop, Math.min(preferredTop, maxTop));
+
+    setContextCardCoords({ left, top });
+  }, [contextCardAnchor, showHeaderFooter, selectionText, deleteMenu]);
 
   // func for searching entire book
   // Search the entire book (streams results as it goes)
@@ -1115,7 +1340,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
   return (
     <>
-      <div className="flex flex-col absolute w-full h-full top-0 overflow-hidden">
+      <div
+        ref={readerContainerRef}
+        className="flex flex-col absolute w-full h-full top-0 overflow-hidden"
+      >
         {/* TOP BAR */}
         {showHeaderFooter && (
           <div
@@ -1125,53 +1353,14 @@ export default function Reader({ bookData, onClose }: readerProps) {
               }`}
           >
             <div className="flex">
-              {!pendingHighlight.current ? (
-                <button
-                  onClick={() => {
-                    setShowSidebar(true);
-                    setShowHeaderFooter(false);
-                  }}
-                  className={`rounded py-2 px-3 ${isLight ? "hover:bg-black/5" : "hover:bg-white/5"
-                    }`}
-                >
-                  ☰ Menu
-                </button>
-              ) : (
-                <div className="flex gap-2">
-                  <button
-                    onClick={handleDictionaryLookup}
-                    className="bg-blue-700 hover:bg-blue-500 text-white px-4 py-2 rounded text-sm flex items-center gap-2"
-                  >
-                    <span>🔎</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      const { cfi, contents } = pendingHighlight.current!;
-                      finalizeHighlight(cfi, contents);
-                      closeContextUI();
-                    }}
-                    className="bg-yellow-700 hover:bg-yellow-500 text-white px-4 py-2 rounded text-sm font-medium"
-                  >
-                    ✏️
-                  </button>
-                  <button
-                    onClick={closeContextUI}
-                    className="px-4 py-2 text-sm rounded bg-[#e24741] text-white"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {deleteMenu && (
               <button
-                onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
-                className="bg-[#e24741] hover:bg-red-700 text-white py-1.5 px-3 rounded transition-colors text-sm"
+                onClick={() => openOverlayWithCfi(setShowSidebar)}
+                className={`rounded py-2 px-3 ${isLight ? "hover:bg-black/5" : "hover:bg-white/5"
+                  }`}
               >
-                Delete Highlight
+                ☰ Menu
               </button>
-            )}
+            </div>
 
             <button
               onClick={onClose}
@@ -1192,7 +1381,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
                   Search Book
                 </h2>
                 <button
-                  onClick={() => setShowSearch(false)}
+                  onClick={() => closeOverlayAndRestore(setShowSearch)}
                   className="text-gray-400 hover:text-white px-2 rounded hover:bg-white/10 transition-colors"
                 >
                   ✕
@@ -1205,6 +1394,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
                   type="text"
                   placeholder="Start typing to search..."
                   value={searchQuery}
+                  onFocus={() => {
+                    overlayInputFocusedRef.current = true;
+                  }}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="w-full bg-[#121212] border border-white/20 rounded-md px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors text-white placeholder-gray-500"
                 />
@@ -1239,9 +1431,14 @@ export default function Reader({ bookData, onClose }: readerProps) {
                       <button
                         key={i}
                         onClick={async () => {
-                          await rendition.display(res.cfi);
-                          await rendition.display(res.cfi); // Double execution hack
+                          const hadInputFocus = overlayInputFocusedRef.current;
+                          overlayCfiRef.current = null;
+                          overlayInputFocusedRef.current = false;
                           setShowSearch(false);
+                          await displayCfi(res.cfi);
+                          if (hadInputFocus) {
+                            scheduleCfiRestore(res.cfi);
+                          }
                         }}
                         className="w-full text-left p-4 hover:bg-white/5 rounded-lg border-b border-white/5 transition-colors focus:bg-white/10 focus:outline-none"
                       >
@@ -1347,6 +1544,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
                           type="text"
                           placeholder="Search highlights..."
                           value={highlightsSearch}
+                          onFocus={() => {
+                            overlayInputFocusedRef.current = true;
+                          }}
                           onChange={(e) => setHighlightsSearch(e.target.value)}
                           className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"
                         />
@@ -1383,10 +1583,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
                             <button
                               key={index}
                               onClick={() => {
-                                lookupCfiRef.current =
-                                  rendition?.currentLocation?.()?.start?.cfi ||
-                                  rendition?.location?.start?.cfi ||
-                                  null;
+                                lookupCfiRef.current = getCurrentCfi();
                                 window.open(url, "_blank", "noopener,noreferrer");
                               }}
                               className="aspect-square rounded overflow-hidden bg-white/5 hover:ring-2 hover:ring-blue-500 transition-all"
@@ -1415,7 +1612,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
             <div
               className="flex-1 bg-black/50"
-              onClick={() => setShowSidebar(false)}
+              onClick={() => closeOverlayAndRestore(setShowSidebar)}
             ></div>
           </div>
         )}
@@ -1427,6 +1624,79 @@ export default function Reader({ bookData, onClose }: readerProps) {
           className={`flex-1 overflow-hidden relative z-0 [&_.epub-container]:overflow-x-hidden [&_.epub-container]:[scrollbar-width:none] [&_.epub-container::-webkit-scrollbar]:hidden ${theme === "light" ? "bg-[#fbf5e6]" : "bg-[#1c1c1c]"
             }`}
         ></div>
+
+        {/* FLOATING CONTEXT CARD FOR SELECTED TEXT / CLICKED HIGHLIGHT */}
+        {!showSidebar &&
+          !showSearch &&
+          contextCardAnchor &&
+          (selectionText || deleteMenu) && (
+            <div
+              ref={contextCardRef}
+              style={{
+                left: contextCardCoords ? `${contextCardCoords.left}px` : "0px",
+                top: contextCardCoords ? `${contextCardCoords.top}px` : "0px",
+                visibility: contextCardCoords ? "visible" : "hidden",
+              }}
+              className={`absolute z-[15] rounded-xl p-1.5 flex items-center gap-1 shadow-2xl border whitespace-nowrap ${isLight
+                ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
+                : "bg-[#242424] text-white border-white/15"
+                }`}
+            >
+              {deleteMenu ? (
+                <>
+                  <button
+                    onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
+                    className="bg-[#e24741] hover:bg-red-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                  >
+                    Delete Highlight
+                  </button>
+                  <button
+                    onClick={() => {
+                      setDeleteMenu(null);
+                      setContextCardAnchor(null);
+                    }}
+                    aria-label="Close context card"
+                    className={`px-2 py-1.5 rounded-lg text-xs transition-colors ${isLight ? "hover:bg-black/10 text-black/60" : "hover:bg-white/10 text-white/60"
+                      }`}
+                  >
+                    ✕
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={handleDictionaryLookup}
+                    className="bg-blue-700 hover:bg-blue-600 text-white px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                  >
+                    <span>🌐</span>
+                    <span>Define</span>
+                  </button>
+                  <button
+                    onClick={handleSearchSelection}
+                    className="bg-blue-800 hover:bg-blue-700 text-white px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                  >
+                    <span>🔎</span>
+                    <span>Search</span>
+                  </button>
+                  <button
+                    onClick={handleFinalizePendingHighlight}
+                    className="bg-yellow-700 hover:bg-yellow-600 text-white px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                  >
+                    <span>✏️</span>
+                    <span>Highlight</span>
+                  </button>
+                  <button
+                    onClick={closeContextUI}
+                    aria-label="Cancel selection"
+                    className={`px-2 py-1.5 rounded-lg text-xs transition-colors ${isLight ? "hover:bg-black/10 text-black/60" : "hover:bg-white/10 text-white/60"
+                      }`}
+                  >
+                    ✕
+                  </button>
+                </>
+              )}
+            </div>
+          )}
 
         {/* PERSISTENT FOOTER */}
         {!showHeaderFooter && !showSidebar && (
@@ -1551,10 +1821,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
             {/* Right Side */}
             <div className="w-1/3 flex justify-end">
               <button
-                onClick={() => {
-                  setShowSearch(true);
-                  setShowHeaderFooter(false);
-                }}
+                onClick={handleSearchSelection}
                 className="rounded py-2 px-3 bg-blue-800 text-white"
               >
                 🔎
