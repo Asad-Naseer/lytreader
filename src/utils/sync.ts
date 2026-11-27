@@ -15,6 +15,15 @@ const SYNC_META_KEY = "lytreader-sync-meta";
 const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB chunks for >140 MB EPUBs
 const SINGLE_UPLOAD_LIMIT = 140 * 1024 * 1024;
 
+export interface BookDailyStat {
+  date: string; // YYYY-MM-DD (local date)
+  percentage: number;
+  wpm: number;
+  words: number;
+  seconds: number;
+  updatedAt: number;
+}
+
 export interface SyncHighlight {
   cfi: string;
   text: string;
@@ -24,15 +33,22 @@ export interface SyncHighlight {
   deletedAt?: number;
 }
 
+export interface SyncPinState {
+  value: boolean;
+  updatedAt: number;
+}
+
 export interface SyncBookState {
   name?: string;
   addedAt?: number;
   lastOpenedAt?: number;
+  pinned?: SyncPinState;
   progress?: {
     cfi: string;
     updatedAt: number;
   };
   highlights: SyncHighlight[];
+  dailyStats?: BookDailyStat[];
 }
 
 export interface SyncSettings {
@@ -56,6 +72,7 @@ export interface CloudData {
 interface LocalSyncMeta {
   bookAddedAt: Record<string, number>;
   bookLastOpenedAt: Record<string, number>;
+  pinnedBooks: Record<string, { pinned: boolean; updatedAt: number }>;
   deletedBooks: Record<string, number>;
   progressUpdatedAt: Record<string, number>;
   deletedHighlights: Record<string, Record<string, number>>;
@@ -79,14 +96,23 @@ export interface SyncResult {
   metadataChanged: boolean;
 }
 
-// Serialize local sync-meta updates so rapid scrolled `relocated` events never race
+// Serialize local sync-meta and reading-stats updates so rapid scrolled `relocated` events never race
 let metaWriteQueue: Promise<void> = Promise.resolve();
+let statsWriteQueue: Promise<void> = Promise.resolve();
+
+const getLocalDateKey = (date = new Date()): string => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
 
 const getSyncMeta = async (): Promise<LocalSyncMeta> => {
   const saved = await localforage.getItem<Partial<LocalSyncMeta>>(SYNC_META_KEY);
   return {
     bookAddedAt: { ...(saved?.bookAddedAt ?? {}) },
     bookLastOpenedAt: { ...(saved?.bookLastOpenedAt ?? {}) },
+    pinnedBooks: { ...(saved?.pinnedBooks ?? {}) },
     deletedBooks: { ...(saved?.deletedBooks ?? {}) },
     progressUpdatedAt: { ...(saved?.progressUpdatedAt ?? {}) },
     deletedHighlights: { ...(saved?.deletedHighlights ?? {}) },
@@ -123,6 +149,28 @@ export const touchBookLastOpenedMeta = (bookId: string): Promise<void> => {
   });
 };
 
+export const setBookPinnedMeta = (
+  bookId: string,
+  pinned: boolean,
+): Promise<void> => {
+  const now = Date.now();
+  return updateSyncMeta((meta) => {
+    meta.pinnedBooks[bookId] = { pinned, updatedAt: now };
+  });
+};
+
+export const getPinnedBookIds = async (): Promise<Set<string>> => {
+  await metaWriteQueue;
+  const meta = await getSyncMeta();
+  const pinned = new Set<string>();
+  for (const [bookId, state] of Object.entries(meta.pinnedBooks)) {
+    if (state?.pinned) {
+      pinned.add(bookId);
+    }
+  }
+  return pinned;
+};
+
 export const getBookSortTimestamps = async (): Promise<
   Record<string, number>
 > => {
@@ -142,20 +190,129 @@ export const getBookSortTimestamps = async (): Promise<
 export const sortBooksList = (
   books: Book[],
   timestamps: Record<string, number>,
+  pinnedIds?: Set<string>,
 ): Book[] => {
   return [...books].sort((a, b) => {
+    const aPinned = pinnedIds?.has(a.id) ? 1 : 0;
+    const bPinned = pinnedIds?.has(b.id) ? 1 : 0;
+    if (aPinned !== bPinned) return bPinned - aPinned;
+
     const diff = (timestamps[b.id] ?? 0) - (timestamps[a.id] ?? 0);
     if (diff !== 0) return diff;
     return a.name.localeCompare(b.name);
   });
 };
 
+export const recordBookReadingStat = (
+  bookId: string,
+  params: { percentage?: number; addedWords?: number; addedSeconds?: number },
+): Promise<BookDailyStat[]> => {
+  const resultPromise = statsWriteQueue.then(async () => {
+    const today = getLocalDateKey();
+    const existing =
+      (await localforage.getItem<BookDailyStat[]>(`stats-${bookId}`)) ?? [];
+    const list = Array.isArray(existing)
+      ? existing.map((item) => ({ ...item }))
+      : [];
+
+    let entry = list.find((item) => item.date === today);
+    const now = Date.now();
+    if (!entry) {
+      entry = {
+        date: today,
+        percentage: 0,
+        wpm: 0,
+        words: 0,
+        seconds: 0,
+        updatedAt: now,
+      };
+      list.push(entry);
+    }
+
+    let changed = false;
+
+    if (
+      typeof params.percentage === "number" &&
+      Number.isFinite(params.percentage)
+    ) {
+      const clamped = Math.min(100, Math.max(0, Math.round(params.percentage)));
+      if (clamped > entry.percentage) {
+        entry.percentage = clamped;
+        changed = true;
+      }
+    }
+
+    if (
+      typeof params.addedWords === "number" &&
+      params.addedWords > 0 &&
+      typeof params.addedSeconds === "number" &&
+      params.addedSeconds > 0
+    ) {
+      entry.words += Math.round(params.addedWords);
+      entry.seconds += params.addedSeconds;
+      if (entry.seconds >= 5) {
+        entry.wpm = Math.round((entry.words / entry.seconds) * 60);
+      }
+      changed = true;
+    }
+
+    if (changed) {
+      entry.updatedAt = now;
+      list.sort((a, b) => b.date.localeCompare(a.date));
+      await localforage.setItem(`stats-${bookId}`, list);
+    }
+
+    return list;
+  });
+
+  statsWriteQueue = resultPromise.then(
+    () => undefined,
+    (err) => {
+      console.error("Failed to record reading stat:", err);
+    },
+  );
+
+  return resultPromise;
+};
+
+export const getBookDailyStats = async (
+  bookId: string,
+): Promise<BookDailyStat[]> => {
+  await statsWriteQueue;
+  const saved = await localforage.getItem<BookDailyStat[]>(`stats-${bookId}`);
+  if (!Array.isArray(saved)) return [];
+  return [...saved].sort((a, b) => b.date.localeCompare(a.date));
+};
+
+export const getAllBookDailyStats = async (): Promise<
+  Record<string, BookDailyStat[]>
+> => {
+  await statsWriteQueue;
+  const keys = await localforage.keys();
+  const statKeys = keys.filter((k) => k.startsWith("stats-"));
+  const result: Record<string, BookDailyStat[]> = {};
+
+  await Promise.all(
+    statKeys.map(async (key) => {
+      const stats = await localforage.getItem<BookDailyStat[]>(key);
+      if (Array.isArray(stats) && stats.length > 0) {
+        const bookId = key.slice("stats-".length);
+        result[bookId] = [...stats].sort((a, b) => b.date.localeCompare(a.date));
+      }
+    }),
+  );
+
+  return result;
+};
+
 export const deleteBookLocally = async (bookId: string): Promise<void> => {
+  await statsWriteQueue;
   await Promise.all([
     localforage.removeItem(bookId),
     localforage.removeItem(`progress-${bookId}`),
     localforage.removeItem(`highlights-${bookId}`),
     localforage.removeItem(`locations-${bookId}`),
+    localforage.removeItem(`stats-${bookId}`),
   ]);
 
   const now = Date.now();
@@ -163,6 +320,7 @@ export const deleteBookLocally = async (bookId: string): Promise<void> => {
     meta.deletedBooks[bookId] = now;
     delete meta.bookAddedAt[bookId];
     delete meta.bookLastOpenedAt[bookId];
+    delete meta.pinnedBooks[bookId];
     delete meta.progressUpdatedAt[bookId];
     delete meta.deletedHighlights[bookId];
   });
@@ -270,26 +428,43 @@ const canonicalEqual = (a: unknown, b: unknown): boolean => {
   if (keysA.length !== keysB.length) return false;
 
   return keysA.every(
-    (k) => Object.prototype.hasOwnProperty.call(objB, k) && canonicalEqual(objA[k], objB[k]),
+    (k) =>
+      Object.prototype.hasOwnProperty.call(objB, k) &&
+      canonicalEqual(objA[k], objB[k]),
   );
 };
+
+const normalizeStatsList = (list: BookDailyStat[]): BookDailyStat[] =>
+  [...list]
+    .map((s) => ({
+      date: s.date,
+      percentage: Math.min(100, Math.max(0, Math.round(s.percentage ?? 0))),
+      wpm: Math.max(0, Math.round(s.wpm ?? 0)),
+      words: Math.max(0, Math.round(s.words ?? 0)),
+      seconds: Math.max(0, Number(s.seconds ?? 0)),
+      updatedAt: s.updatedAt ?? 0,
+    }))
+    .sort((a, b) => b.date.localeCompare(a.date));
 
 const buildLocalCloudData = async (): Promise<{
   localData: CloudData;
   localBooks: Record<string, Book>;
   localProgress: Record<string, string>;
   localHighlights: Record<string, StoredHighlightItem[]>;
+  localStats: Record<string, BookDailyStat[]>;
   localFontSize: number | null;
   localTheme: "dark" | "light" | null;
   meta: LocalSyncMeta;
 }> => {
   await metaWriteQueue;
+  await statsWriteQueue;
   const meta = await getSyncMeta();
   const keys = await localforage.keys();
 
   const localBooks: Record<string, Book> = {};
   const localProgress: Record<string, string> = {};
   const localHighlights: Record<string, StoredHighlightItem[]> = {};
+  const localStats: Record<string, BookDailyStat[]> = {};
   let localFontSize: number | null = null;
   let localTheme: "dark" | "light" | null = null;
 
@@ -306,6 +481,11 @@ const buildLocalCloudData = async (): Promise<{
         if (Array.isArray(list)) {
           localHighlights[key.slice("highlights-".length)] = list;
         }
+      } else if (key.startsWith("stats-")) {
+        const stats = await localforage.getItem<BookDailyStat[]>(key);
+        if (Array.isArray(stats)) {
+          localStats[key.slice("stats-".length)] = normalizeStatsList(stats);
+        }
       } else if (key === "reader-font-size") {
         const fs = await localforage.getItem<number>(key);
         if (typeof fs === "number") localFontSize = fs;
@@ -320,6 +500,8 @@ const buildLocalCloudData = async (): Promise<{
     ...Object.keys(localBooks),
     ...Object.keys(localProgress),
     ...Object.keys(localHighlights),
+    ...Object.keys(localStats),
+    ...Object.keys(meta.pinnedBooks),
     ...Object.keys(meta.deletedHighlights),
     ...Object.keys(meta.deletedBooks),
   ]);
@@ -365,6 +547,8 @@ const buildLocalCloudData = async (): Promise<{
       a.cfi.localeCompare(b.cfi),
     );
 
+    const dailyStats = localStats[id] ?? [];
+    const pinMeta = meta.pinnedBooks[id];
     const progressCfi = localProgress[id];
     const bookName = localBooks[id]?.name;
 
@@ -372,6 +556,14 @@ const buildLocalCloudData = async (): Promise<{
       ...(bookName ? { name: bookName } : {}),
       ...(addedAt > 0 ? { addedAt } : {}),
       ...(lastOpenedAt > 0 ? { lastOpenedAt } : {}),
+      ...(pinMeta
+        ? {
+            pinned: {
+              value: pinMeta.pinned,
+              updatedAt: pinMeta.updatedAt,
+            },
+          }
+        : {}),
       ...(progressCfi
         ? {
             progress: {
@@ -381,6 +573,7 @@ const buildLocalCloudData = async (): Promise<{
           }
         : {}),
       highlights,
+      ...(dailyStats.length > 0 ? { dailyStats } : {}),
     };
   }
 
@@ -408,10 +601,67 @@ const buildLocalCloudData = async (): Promise<{
     localBooks,
     localProgress,
     localHighlights,
+    localStats,
     localFontSize,
     localTheme,
     meta,
   };
+};
+
+const mergeDailyStats = (
+  localStats: BookDailyStat[] = [],
+  remoteStats: BookDailyStat[] = [],
+): BookDailyStat[] => {
+  const byDate = new Map<
+    string,
+    { l?: BookDailyStat; r?: BookDailyStat }
+  >();
+
+  for (const r of remoteStats) {
+    byDate.set(r.date, { r });
+  }
+  for (const l of localStats) {
+    const pair = byDate.get(l.date) ?? {};
+    pair.l = l;
+    byDate.set(l.date, pair);
+  }
+
+  const merged: BookDailyStat[] = [];
+  for (const date of Array.from(byDate.keys()).sort((a, b) =>
+    b.localeCompare(a),
+  )) {
+    const { l, r } = byDate.get(date)!;
+    if (!l) {
+      merged.push(r!);
+      continue;
+    }
+    if (!r) {
+      merged.push(l);
+      continue;
+    }
+
+    const lTime = l.updatedAt ?? 0;
+    const rTime = r.updatedAt ?? 0;
+    let primary: BookDailyStat;
+    if (lTime !== rTime) {
+      primary = lTime > rTime ? l : r;
+    } else if ((l.words ?? 0) !== (r.words ?? 0)) {
+      primary = (l.words ?? 0) > (r.words ?? 0) ? l : r;
+    } else {
+      primary = (l.percentage ?? 0) >= (r.percentage ?? 0) ? l : r;
+    }
+
+    merged.push({
+      date,
+      percentage: Math.max(l.percentage ?? 0, r.percentage ?? 0),
+      wpm: primary.wpm ?? 0,
+      words: primary.words ?? 0,
+      seconds: primary.seconds ?? 0,
+      updatedAt: Math.max(lTime, rTime),
+    });
+  }
+
+  return normalizeStatsList(merged);
 };
 
 const mergeCloudData = (
@@ -477,6 +727,16 @@ const mergeCloudData = (
 
     const name = rBook?.name || lBook?.name;
 
+    let pinned: SyncPinState | undefined;
+    if (lBook?.pinned && rBook?.pinned) {
+      pinned =
+        lBook.pinned.updatedAt > rBook.pinned.updatedAt
+          ? lBook.pinned
+          : rBook.pinned;
+    } else {
+      pinned = rBook?.pinned || lBook?.pinned;
+    }
+
     let progress: SyncBookState["progress"];
     if (lBook?.progress && rBook?.progress) {
       progress =
@@ -540,12 +800,19 @@ const mergeCloudData = (
       }
     }
 
+    const mergedDailyStats = mergeDailyStats(
+      lBook?.dailyStats,
+      rBook?.dailyStats,
+    );
+
     mergedBooks[id] = {
       ...(name ? { name } : {}),
       ...(maxAddedAt > 0 ? { addedAt: maxAddedAt } : {}),
       ...(maxLastOpenedAt > 0 ? { lastOpenedAt: maxLastOpenedAt } : {}),
+      ...(pinned ? { pinned } : {}),
       ...(progress ? { progress } : {}),
       highlights: mergedHighlights,
+      ...(mergedDailyStats.length > 0 ? { dailyStats: mergedDailyStats } : {}),
     };
   }
 
@@ -584,6 +851,7 @@ const applyMergedStateLocally = async (
   const newMeta: LocalSyncMeta = {
     bookAddedAt: {},
     bookLastOpenedAt: {},
+    pinnedBooks: {},
     deletedBooks: { ...(merged.deletedBooks ?? {}) },
     progressUpdatedAt: {},
     deletedHighlights: {},
@@ -610,13 +878,15 @@ const applyMergedStateLocally = async (
     const hadBook = Boolean(localState.localBooks[bookId]);
     const hadProgress = Boolean(localState.localProgress[bookId]);
     const hadHighlights = Boolean(localState.localHighlights[bookId]);
+    const hadStats = Boolean(localState.localStats[bookId]);
 
-    if (hadBook || hadProgress || hadHighlights) {
+    if (hadBook || hadProgress || hadHighlights || hadStats) {
       await Promise.all([
         localforage.removeItem(bookId),
         localforage.removeItem(`progress-${bookId}`),
         localforage.removeItem(`highlights-${bookId}`),
         localforage.removeItem(`locations-${bookId}`),
+        localforage.removeItem(`stats-${bookId}`),
       ]);
     }
     if (hadBook) {
@@ -630,6 +900,12 @@ const applyMergedStateLocally = async (
     }
     if (bookState.lastOpenedAt && bookState.lastOpenedAt > 0) {
       newMeta.bookLastOpenedAt[bookId] = bookState.lastOpenedAt;
+    }
+    if (bookState.pinned) {
+      newMeta.pinnedBooks[bookId] = {
+        pinned: bookState.pinned.value,
+        updatedAt: bookState.pinned.updatedAt,
+      };
     }
 
     if (bookState.progress) {
@@ -664,6 +940,14 @@ const applyMergedStateLocally = async (
     if (!canonicalEqual(activeHighlights, existingList)) {
       if (activeHighlights.length > 0 || localState.localHighlights[bookId]) {
         await localforage.setItem(`highlights-${bookId}`, activeHighlights);
+      }
+    }
+
+    const mergedStats = normalizeStatsList(bookState.dailyStats ?? []);
+    const existingStats = localState.localStats[bookId] ?? [];
+    if (!canonicalEqual(mergedStats, existingStats)) {
+      if (mergedStats.length > 0 || localState.localStats[bookId]) {
+        await localforage.setItem(`stats-${bookId}`, mergedStats);
       }
     }
   }
@@ -868,7 +1152,7 @@ const extractBookDetails = async (
 export const syncWithDropbox = async (): Promise<SyncResult> => {
   const dbx = await getDropboxClient();
 
-  // 1. Merge tiny data.json first (highlights, reading positions, order, settings, deletions)
+  // 1. Merge tiny data.json first (highlights, reading positions, order, pins, stats, settings, deletions)
   const { mergedData, localBooks, deletedBookIds, metadataChanged } =
     await syncMetadataFile(dbx);
 

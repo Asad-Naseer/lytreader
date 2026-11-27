@@ -1,13 +1,13 @@
 import type { Book } from "../App";
 import { useRef, useState, useEffect, useLayoutEffect } from "react";
-import ePub from "epubjs";
+import ePub, { EpubCFI } from "epubjs";
 import localforage from "localforage";
-import { EpubCFI } from "epubjs";
 import {
   touchProgressMeta,
   recordHighlightTombstone,
   clearHighlightTombstone,
   touchSettingsMeta,
+  recordBookReadingStat,
 } from "../utils/sync";
 
 interface readerProps {
@@ -51,8 +51,17 @@ export default function Reader({ bookData, onClose }: readerProps) {
   const [backwardsOnly, setBackwardsOnly] = useState<boolean>(false);
   const prevSearchQueryRef = useRef<string>("");
 
-  // define a ref html div element to pass to epubjs so it can render the book into it
-  const viewerRef = useRef<HTMLDivElement>(null); // this is just a plain div element. <div><div/>
+  // Active reading WPM & daily progress tracking refs
+  const readingAnchorRef = useRef<{ cfi: string; timestamp: number } | null>(
+    null,
+  );
+  const visibleSinceRef = useRef<number | null>(
+    document.visibilityState === "visible" ? Date.now() : null,
+  );
+  const accumulatedActiveMsRef = useRef<number>(0);
+  const skipNextReadingTrackRef = useRef<boolean>(false);
+
+  const viewerRef = useRef<HTMLDivElement>(null);
   const readerContainerRef = useRef<HTMLDivElement>(null);
   const contextCardRef = useRef<HTMLDivElement>(null);
   const [contextCardAnchor, setContextCardAnchor] = useState<{
@@ -65,44 +74,27 @@ export default function Reader({ bookData, onClose }: readerProps) {
     top: number;
   } | null>(null);
 
-  // define a promise ref for generation of locations
   const locationsPromiseRef = useRef<Promise<any> | null>(null);
-
-  // define pending highlight var to check for when highlights start and deciding when to finalize them
   const pendingHighlight = useRef<{ cfi: string; contents: any } | null>(null);
   const lastTapViewportRef = useRef<{ x: number; y: number } | null>(null);
 
-  // define selection text for dictionary lookup
   const [selectionText, setSelectionText] = useState<string>("");
-
-  // define bookHighlightsKey for loading book highlights
   const bookHighlightsKey = `highlights-${bookData.id}`;
-
-  // Define the key for locations storage
   const bookLocationsKey = `locations-${bookData.id}`;
 
-  // define list state for highlights
   const [highlightsList, setHighlightsList] = useState<highlightItem[]>([]);
-  // define state for searching the highlights
   const [highlightsSearch, setHighlightsSearch] = useState<string>("");
-
-  // define deleteMenu state for deleting highlights. this will use x,y values to determine where it should appear.
   const [deleteMenu, setDeleteMenu] = useState<{ cfi: string } | null>(null);
 
-  // define rendition and pageInfo states for epubjs and book state
   const [book, setBook] = useState<any>(null);
   const [rendition, setRendition] = useState<any>(null);
   const [pageInfo, setPageInfo] = useState<string>("Calculating");
 
-  // define states for the persisten footer
   const [currentChapter, setCurrentChapter] =
     useState<string>("Unknown Chapter");
   const [currentPercentage, setCurrentPercentage] = useState<number>(0);
-
-  // add states for currentChapterHref for exact location tracking when reading a trilogy or multi-book epub
   const [currentChapterHref, setCurrentChapterHref] = useState<string>("");
 
-  // define a state to control the visibility of the header
   const [showHeaderFooter, setShowHeaderFooter] = useState<boolean>(false);
 
   // Sidebar and TOC states
@@ -110,29 +102,24 @@ export default function Reader({ bookData, onClose }: readerProps) {
   const [sidebarTab, setSidebarTab] = useState<"toc" | "highlights" | "photos">(
     "toc",
   );
-  // states for handling photos in sidebarTab
   const [photosList, setPhotosList] = useState<string[]>([]);
   const [photosLoading, setPhotosLoading] = useState<boolean>(false);
-  // we will use this for preventing memory leaks. (see loadPhotos function in fetch photos useEffect())
   const photoBlobUrlsRef = useRef<string[]>([]);
-  // state for handling toc
   const [toc, setToc] = useState<tocItem[]>([]);
 
-  // Safely escape regex characters to prevent crashes, and ignore empty queries ( for searching the entire book ), see search results area section.
   const highlightQuery = searchQuery.trim();
   const safeRegex = highlightQuery
     ? new RegExp(
-      `(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`,
-      "gi",
-    )
+        `(${highlightQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`,
+        "gi",
+      )
     : null;
 
-  // Fontsize states
-  const [fontSize, setFontSize] = useState<number>(100); // percentage
+  const [fontSize, setFontSize] = useState<number>(100);
   const [showFontMenu, setShowFontMenu] = useState<boolean>(false);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
 
-  // 1. Load saved font size on initial mount
+  // 1. Load saved font size and reader theme on initial mount
   useEffect(() => {
     const loadSavedSettings = async () => {
       const savedFontSize =
@@ -150,34 +137,51 @@ export default function Reader({ bookData, onClose }: readerProps) {
     loadSavedSettings();
   }, []);
 
-  // Use useEffect to make sure book is loaded then check if both viewerRef and bookData.data are present.
-  // Setup new rendition, generate page locations and update state whenever rendition is "relocated" (page changes)
-
+  // Track tab visibility so backgrounded time never inflates/deflates WPM
   useEffect(() => {
-    if (!viewerRef.current || !bookData.data) return; // stop execution if either are false/missing
+    const handleVisibilityTrack = () => {
+      const now = Date.now();
+      if (document.visibilityState === "hidden") {
+        if (visibleSinceRef.current !== null) {
+          accumulatedActiveMsRef.current += now - visibleSinceRef.current;
+          visibleSinceRef.current = null;
+        }
+      } else if (document.visibilityState === "visible") {
+        if (visibleSinceRef.current === null) {
+          visibleSinceRef.current = now;
+        }
+      }
+    };
 
-    // const isMobile = window.innerWidth < 1000;
+    document.addEventListener("visibilitychange", handleVisibilityTrack);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityTrack);
+    };
+  }, []);
 
-    // initialize book using the data and epubjs and create and display rendition
+  // Initialize book & rendition
+  useEffect(() => {
+    if (!viewerRef.current || !bookData.data) return;
+
+    readingAnchorRef.current = null;
+    accumulatedActiveMsRef.current = 0;
+    visibleSinceRef.current =
+      document.visibilityState === "visible" ? Date.now() : null;
+    skipNextReadingTrackRef.current = false;
+
     const newBook = ePub(bookData.data);
     setBook(newBook);
     const newRendition = newBook.renderTo(viewerRef.current, {
       width: "100%",
       height: "100%",
-      // flow: isMobile ? "scrolled" : "paginated",
       flow: "scrolled",
-      // minSpreadWidth: 1000,
     } as any);
 
-    // disable chrome opening context menu on every click;
     newRendition.hooks.content.register((contents: any) => {
       const doc = contents.document;
       const body = doc.body;
 
       if (body) {
-        // tabindex=-1 suppresses tap-to-search; contenteditable + inputmode=none makes Chrome treat
-        // text selection as an editable region (suppressing the selection Touch-to-Search bar)
-        // without opening the virtual keyboard.
         body.setAttribute("tabindex", "-1");
         body.setAttribute("contenteditable", "true");
         body.setAttribute("inputmode", "none");
@@ -188,15 +192,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
       const preventDefault = (e: Event) => {
         e.preventDefault();
       };
-      // Keep the book read-only while contenteditable is enabled
       doc.addEventListener("beforeinput", preventDefault);
       doc.addEventListener("paste", preventDefault);
       doc.addEventListener("cut", preventDefault);
       doc.addEventListener("drop", preventDefault);
-      // Prevent the default OS context menu (copy/paste/share) from appearing on long press
       doc.addEventListener("contextmenu", preventDefault);
 
-      // Record real viewport tap coordinates before marks-pane clones the event (which strips clientX/clientY)
       const recordTapCoords = (e: MouseEvent | TouchEvent) => {
         const touch =
           "touches" in e && e.touches?.length
@@ -221,31 +222,21 @@ export default function Reader({ bookData, onClose }: readerProps) {
       doc.addEventListener("mousedown", recordTapCoords, true);
     });
 
-    // Inject CSS into the epub iframe to prevent text selection and touch callouts. Otherwise text will get selected whenever user clicks to change page on a touch screen.
     newRendition.themes.default({
       body: {
-        // "-webkit-user-select": "none",
-        // "user-select": "none",
-        "-webkit-touch-callout": "none", // Disables the iOS/Android popup menu
+        "-webkit-touch-callout": "none",
         "caret-color": "transparent",
         outline: "none",
         color: "#c2c2c2",
         "max-width": "1000px !important",
         margin: "0 auto !important",
         padding: "0 10px !important",
-        // "box-sizing": "border-box !important",
-        // "padding": "0px !important"
       },
       "::selection": {
         background: "rgba(59, 130, 246, 0.3)",
       },
-      // ".epubjs-hl": {
-      //   fill: "#3b82f6",
-      //   "fill-opacity": "0.3",
-      // },
     });
 
-    // Get TOC from epubjs
     newBook.loaded.navigation.then((nav: any) => {
       setToc(nav.toc);
     });
@@ -253,7 +244,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
     let lastKnownCfi: string | null = null;
     let hasCompletedInitialDisplay = false;
 
-    // actually display the rendition and check for stored book positions
     const loadSavedPositions = async () => {
       const savedCfi = await localforage.getItem<string>(
         `progress-${bookData.id}`,
@@ -267,34 +257,34 @@ export default function Reader({ bookData, onClose }: readerProps) {
         await newRendition.display();
       }
       hasCompletedInitialDisplay = true;
+
+      const currentLoc = newRendition.currentLocation() as any;
+      const startCfi = currentLoc?.start?.cfi || savedCfi;
+      if (startCfi) {
+        readingAnchorRef.current = { cfi: startCfi, timestamp: Date.now() };
+        accumulatedActiveMsRef.current = 0;
+        visibleSinceRef.current =
+          document.visibilityState === "visible" ? Date.now() : null;
+      }
     };
 
     loadSavedPositions();
 
-    // now calculate and update pageInfo state (page numbers)
-
     newBook.ready
       .then(async () => {
-        // 1. Try to load saved locations from localforage
         const savedLocations =
           await localforage.getItem<string>(bookLocationsKey);
 
         if (savedLocations) {
           console.log("Found cached locations, loading instantly...");
           newBook.locations.load(savedLocations);
-
-          // Wrap in a resolved promise so locationsPromiseRef.current is "ready" for other functions
           locationsPromiseRef.current = Promise.resolve(newBook.locations);
         } else {
           console.log(
             "No cached locations found. Generating (this might take a while)...",
           );
-
-          // 2. If not found, generate them normally
           locationsPromiseRef.current = newBook.locations.generate(100);
           await locationsPromiseRef.current;
-
-          // 3. Save the generated locations for next time
           await localforage.setItem(bookLocationsKey, newBook.locations.save());
           console.log("Locations generated and cached.");
         }
@@ -302,7 +292,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
         return locationsPromiseRef.current;
       })
       .then((_locations: any) => {
-        // This updates the "1 / 500" display immediately after loading/generating
         const currentLocation = newRendition.currentLocation() as any;
         if (currentLocation && currentLocation.start.displayed.total) {
           setPageInfo(
@@ -311,33 +300,94 @@ export default function Reader({ bookData, onClose }: readerProps) {
         }
       });
 
-    // setup state updates for whenver user turns a page (rendition relocates)
     newRendition.on("relocated", async (location: any) => {
-      // Save position to browser indexedDB via localforage
-      localforage.setItem(`progress-${bookData.id}`, location.start.cfi);
-      console.log("cfi saved", location.start.cfi);
+      const now = Date.now();
+      const newCfi: string = location.start.cfi;
+
+      // Capture active reading time & words traversed synchronously before async awaits
+      let wordsDelta = 0;
+      let activeSecondsDelta = 0;
+      let didUserReadMove = false;
+
+      if (hasCompletedInitialDisplay) {
+        const liveMs =
+          visibleSinceRef.current !== null ? now - visibleSinceRef.current : 0;
+        const elapsedSec = (accumulatedActiveMsRef.current + liveMs) / 1000;
+
+        accumulatedActiveMsRef.current = 0;
+        visibleSinceRef.current =
+          document.visibilityState === "visible" ? now : null;
+
+        const prevAnchor = readingAnchorRef.current;
+        if (skipNextReadingTrackRef.current || !prevAnchor) {
+          skipNextReadingTrackRef.current = false;
+          readingAnchorRef.current = { cfi: newCfi, timestamp: now };
+        } else {
+          didUserReadMove = newCfi !== prevAnchor.cfi;
+          try {
+            const cfiHelper = (newRendition as any).epubcfi || new EpubCFI();
+            const isForward = cfiHelper.compare(newCfi, prevAnchor.cfi) > 0;
+
+            if (isForward && elapsedSec >= 1 && elapsedSec <= 180) {
+              const r1 = newRendition.getRange(prevAnchor.cfi);
+              const r2 = newRendition.getRange(newCfi);
+              if (
+                r1 &&
+                r2 &&
+                r1.startContainer?.ownerDocument &&
+                r1.startContainer.ownerDocument ===
+                  r2.startContainer?.ownerDocument
+              ) {
+                const doc = r1.startContainer.ownerDocument;
+                const span = doc.createRange();
+                span.setStart(r1.startContainer, r1.startOffset);
+                span.setEnd(r2.startContainer, r2.startOffset);
+                const segmentText = span.toString().trim();
+                const count = segmentText
+                  ? segmentText.split(/\s+/).filter(Boolean).length
+                  : 0;
+                const instantWpm = count > 0 ? (count / elapsedSec) * 60 : 0;
+                if (
+                  count >= 3 &&
+                  count <= 2500 &&
+                  instantWpm >= 20 &&
+                  instantWpm <= 1000
+                ) {
+                  wordsDelta = count;
+                  activeSecondsDelta = elapsedSec;
+                }
+              }
+            }
+          } catch {
+            // Ignore transient range mismatch on chapter boundary
+          }
+          readingAnchorRef.current = { cfi: newCfi, timestamp: now };
+        }
+      }
+
+      localforage.setItem(`progress-${bookData.id}`, newCfi);
+      console.log("cfi saved", newCfi);
 
       if (!hasCompletedInitialDisplay) {
         if (!lastKnownCfi) {
-          lastKnownCfi = location.start.cfi;
+          lastKnownCfi = newCfi;
         }
-      } else if (location.start.cfi !== lastKnownCfi) {
-        lastKnownCfi = location.start.cfi;
+      } else if (newCfi !== lastKnownCfi) {
+        lastKnownCfi = newCfi;
         touchProgressMeta(bookData.id);
       }
 
       if (location.start.displayed.total) {
-        // check if epubjs has already calculated total pages
         setPageInfo(
           `${location.start.displayed.page} / ${location.start.displayed.total}`,
         );
       }
 
-      // 1. Get Current Chapter (Loads instantly)
+      // 1. Get Current Chapter
       let chapter = "Unknown Chapter";
       let activeHref = "";
       try {
-        const spineItem = newBook.spine.get(location.start.cfi);
+        const spineItem = newBook.spine.get(newCfi);
         if (spineItem) {
           const nav = await newBook.loaded.navigation;
           const bookToc = nav.toc;
@@ -369,16 +419,14 @@ export default function Reader({ bookData, onClose }: readerProps) {
       setCurrentChapter(chapter);
       setCurrentChapterHref(activeHref);
 
-      // 2. Get Current Percentage (Waits for generation if needed)
+      // 2. Get Current Percentage
       let percent = 0;
       try {
         if (locationsPromiseRef.current) {
-          await locationsPromiseRef.current; // wait if it's still generating
+          await locationsPromiseRef.current;
         }
         if (newBook.locations && newBook.locations.length() > 0) {
-          const percentCfi = newBook.locations.percentageFromCfi(
-            location.start.cfi,
-          );
+          const percentCfi = newBook.locations.percentageFromCfi(newCfi);
           if (percentCfi > 0) {
             percent = Math.round(percentCfi * 100);
           }
@@ -387,12 +435,20 @@ export default function Reader({ bookData, onClose }: readerProps) {
         console.error("Error waiting for locations to generate:", err);
       }
       setCurrentPercentage(percent);
+
+      // 3. Persist daily percentage reached & WPM when user actually reads/moves
+      if (hasCompletedInitialDisplay && (didUserReadMove || wordsDelta > 0)) {
+        void recordBookReadingStat(bookData.id, {
+          percentage: percent,
+          ...(wordsDelta > 0 && activeSecondsDelta > 0
+            ? { addedWords: wordsDelta, addedSeconds: activeSecondsDelta }
+            : {}),
+        });
+      }
     });
 
-    // finally set the rendition state
     setRendition(newRendition);
 
-    // run cleaup func to destroy the book when component unmounts
     return () => {
       newBook.destroy();
     };
@@ -402,7 +458,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
   useEffect(() => {
     if (rendition) {
       rendition.themes.fontSize(`${fontSize}%`);
-      // Save globally to persist accross book reloads
       localforage.setItem("reader-font-size", fontSize);
       console.log("Font size applied", fontSize);
     }
@@ -431,13 +486,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
     touchSettingsMeta("theme");
   };
 
-  // SETTING UP NAVIGATION USING keyboard, clicks and swipes
-  // use useEffect to check if rendition state is live before setting up navigation controls.
-
+  // Navigation controls: keyboard, clicks, swipes
   useEffect(() => {
-    if (!rendition) return; // stop execution if rendition is null or falsy
+    if (!rendition) return;
 
-    // 1. setup Spacebar and Shift + spacebar to go forward or backward.
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (
@@ -445,7 +497,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
         target.tagName === "TEXTAREA" ||
         (target.isContentEditable && !target.closest?.("[data-reader-content]"))
       ) {
-        return; // Exit the function and do nothing if the user is typing
+        return;
       }
 
       if (e.code === "Space") {
@@ -455,45 +507,24 @@ export default function Reader({ bookData, onClose }: readerProps) {
       }
     };
 
-    // 2. Handle clicks (left, right, or middle of the screen)
-
-    // here we have to do some magic with modulo operator to calculate the correct X co-ordinate where the user clicked relative to
-    //width of the screen
-
-    /* this is because epubjs basically creates a long horizontal sheet of the content of the epub. This can cause problems.
-         If the viewer width is 800px, on page one, a click to the left 30% of the screen would register correctly. 
-         But if we are on the second page now the total width goes from 800px at the left to 1600px when we reach the end of the page.
-         even if the user clicks on the left 30% of the viwer it would still count as being a click on the right side and the page would
-         only go forward. For this reason we need to calculate the modulo of the click co-ordinate relative to the viewer width. */
-
     const handleClick = (e: any) => {
-      // if a pending highlight is detected, finalize it immediately.
-      // if (pendingHighlight.current) {
-      //   setShowHeaderFooter(true);
-      //   return;
-
-      // Ignore clicks from finishing a drag-selection or double-click
       const iframeWindow = e.view || e.target?.ownerDocument?.defaultView;
-      if (iframeWindow?.getSelection()?.toString().trim()) { // checks if there is a selection on the iframe window. long drag release will then not cause the contextui to automatically close.
+      if (iframeWindow?.getSelection()?.toString().trim()) {
         return;
       }
 
-      // Clear any collapsed caret from tapping the contenteditable body
       iframeWindow?.getSelection()?.removeAllRanges();
       (iframeWindow?.document?.activeElement as HTMLElement | null)?.blur?.();
 
-      // if a pending highlight is detected, cancel selection and close bars
       if (pendingHighlight.current) {
         closeContextUI();
         return;
       }
 
-      // disappear delete and font menu when user clicks somewhere that is not the delete button
       setDeleteMenu(null);
       setContextCardAnchor(null);
       setShowFontMenu(false);
 
-      // get the width of the viewer
       const viewerWidth = viewerRef.current
         ? viewerRef.current.clientWidth
         : window.innerWidth;
@@ -505,17 +536,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
       } else if (clickX > viewerWidth * 0.99) {
         rendition.next();
       } else {
-        setShowHeaderFooter((prev) => !prev); // set showHeader to flase if true and true if flase
+        setShowHeaderFooter((prev) => !prev);
       }
     };
 
-    // 3. Swipe logic for phones and touch screens
-
-    // declare touchStartX and touchEndX variables
     let touchStartX = 0;
     let touchEndX = 0;
-
-    // create handTouchStart and handleTouchEnd logics which will be passed to rendition appropriately.
 
     const handleTouchStart = (e: any) => {
       touchStartX = e.changedTouches[0].screenX;
@@ -526,22 +552,18 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
       const swipeDistance = touchStartX - touchEndX;
       if (swipeDistance > 200) {
-        rendition.next(); // user swiped from right to left
+        rendition.next();
       } else if (swipeDistance < -200) {
-        rendition.prev(); // user swiped from left to right
+        rendition.prev();
       }
     };
 
-    // listen in on the document for the keyboard keys
     document.addEventListener("keydown", handleKeyDown);
-
-    // listen in on the rendition for everything
     rendition.on("keydown", handleKeyDown);
     rendition.on("click", handleClick);
     rendition.on("touchstart", handleTouchStart);
     rendition.on("touchend", handleTouchEnd);
 
-    // Setup cleanup func to destroy event listeners when component unmounts
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
       rendition.off("keydown", handleKeyDown);
@@ -594,7 +616,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
       {},
       (e: MouseEvent | TouchEvent) => {
         const targetEl = e.target as Element | null;
-        // marks-pane SVG highlights live in the parent document, so frameElement is null when already in viewport coords
         const iframeEl = targetEl?.ownerDocument?.defaultView?.frameElement;
         const rect = targetEl?.getBoundingClientRect?.();
         const childRects = Array.from(
@@ -603,7 +624,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
           .map((r) => r.getBoundingClientRect())
           .filter((r) => r.width > 0 || r.height > 0);
 
-        // Prefer real captured tap coordinates because marks-pane's clone(e) drops clientX/clientY to 0
         const tap = lastTapViewportRef.current;
         const matchedRect =
           tap && childRects.length > 0
@@ -650,37 +670,23 @@ export default function Reader({ bookData, onClose }: readerProps) {
     );
   };
 
-  // make finalizeHighlight function to call automatically after 5 seconds of inactivity after highlighting something
   const finalizeHighlight = async (cfiRange: string, contents: any) => {
     if (!rendition || !book || !pendingHighlight.current) return;
 
-    // only proceed if the highlight has not been finalized yet.
-    if (!pendingHighlight.current) return;
-
-    // Clear native browser text selection inside the iframe
     contents?.window?.getSelection()?.removeAllRanges();
-
-    // clear the pendinghighlight (we already have the cfi and contents from it)
     pendingHighlight.current = null;
 
-    // apply to ui , remove first to make sure no duplicates
     attachHighlightAnnotation(rendition, cfiRange);
 
-    // get the text
     const range = await book.getRange(cfiRange);
     const text = range.toString();
 
-    // calc the percentage
-
-    // 1. Calculate the Percentage
     let percentage = 0;
     try {
-      // If the background page generation is still running, wait for it to finish
       if (locationsPromiseRef.current) {
         await locationsPromiseRef.current;
       }
 
-      // Now that we are 100% sure locations are generated, calculate it
       if (book.locations && book.locations.length() > 0) {
         const percentCfi = book.locations.percentageFromCfi(cfiRange);
         if (percentCfi > 0) {
@@ -691,15 +697,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
       console.error("Error waiting for locations to generate:", err);
     }
 
-    // 2. Calculate the Chapter Title
     let chapter = "Unknown Chapter";
     try {
       const spineItem = book.spine.get(cfiRange);
       if (spineItem) {
-        // helper function to search through the TOC
         const searchToc = (items: tocItem[], href: string): string | null => {
           for (const item of items) {
-            // Match exact href or just the file path without HTML anchors (#)
             if (item.href === href || item.href.split("#")[0] === href)
               return item.label;
             if (item.subitems && item.subitems.length > 0) {
@@ -733,7 +736,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
     }
   };
 
-  // Applying and saving highlights.
   useEffect(() => {
     if (!rendition || !book) return;
     const handleSelected = (cfiRange: string, contents: any) => {
@@ -745,7 +747,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
         contents?.window?.frameElement ||
         viewerRef.current?.querySelector("iframe");
 
-      // mark the cfi and contents passed to handleSelected as pending highlight & give the text to selectionText
       setDeleteMenu(null);
       pendingHighlight.current = { cfi: cfiRange, contents };
       setSelectionText(text);
@@ -755,22 +756,18 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
     rendition.on("selected", handleSelected);
 
-    // cleanup when component dismounts
     return () => {
       rendition.off("selected", handleSelected);
     };
   }, [rendition, book]);
 
-  // Apply saved highlights
   useEffect(() => {
     if (!rendition) return;
 
     const applySavedHighlights = async () => {
-      // get array of CFIs and Texts from storage
       const savedHighlights: highlightItem[] =
         (await localforage.getItem(bookHighlightsKey)) || [];
 
-      // loop through the highlights and apply them
       savedHighlights.forEach((hl) => {
         attachHighlightAnnotation(rendition, hl.cfi);
       });
@@ -780,36 +777,28 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
     rendition.on("rendered", applySavedHighlights);
 
-    // clean up
-
     return () => {
       rendition.off("rendered", applySavedHighlights);
     };
   }, [rendition, bookData.id]);
 
-  // function for removing highlights
   const handleRemoveHighlight = async (cfi: string) => {
     if (!rendition) return;
 
-    // remove highlight from ui
     rendition.annotations.remove(cfi, "highlight");
 
-    // remove from localforage
     const existingHighlights: highlightItem[] =
       (await localforage.getItem(bookHighlightsKey)) || [];
     const updatedHighlights = existingHighlights.filter((h) => h.cfi !== cfi);
     await localforage.setItem(bookHighlightsKey, updatedHighlights);
     await recordHighlightTombstone(bookData.id, cfi);
 
-    // close the menu
     setDeleteMenu(null);
     setContextCardAnchor(null);
   };
 
-  // Auto-scroll to the active chapter when the TOC sidebar is opened
   useEffect(() => {
     if (showSidebar && sidebarTab === "toc") {
-      // We use a tiny timeout to ensure the DOM has finished rendering the sidebar before we scroll
       const timer = setTimeout(() => {
         const activeEl = document.getElementById("active-toc-item");
         if (activeEl) {
@@ -821,7 +810,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
     }
   }, [showSidebar, sidebarTab, currentChapterHref]);
 
-  // fetch highlights data whenever sidebar opens
   useEffect(() => {
     if (showSidebar && sidebarTab === "highlights") {
       const load = async () => {
@@ -829,8 +817,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
           await localforage.getItem<highlightItem[]>(bookHighlightsKey);
 
         if (data) {
-          //sort descending compare b to a
-          // numeric true handles numbers inside strings better
           const sortedData = [...data].sort((a, b) =>
             b.cfi.localeCompare(a.cfi, undefined, {
               numeric: true,
@@ -846,19 +832,17 @@ export default function Reader({ bookData, onClose }: readerProps) {
     }
   }, [showSidebar, sidebarTab, bookHighlightsKey]);
 
-  // Fetch photos from the epub whenever the Photos tab is opened.
   useEffect(() => {
     if (!showSidebar || sidebarTab !== "photos" || !book) return;
 
     setPhotosList([]);
     setPhotosLoading(true);
 
-    let cancelled = false; // guard against stale async runs (StrictMode / fast tab switches)
+    let cancelled = false;
 
     const loadPhotos = async () => {
       try {
         await book.ready;
-
         const manifest = book.packaging.manifest;
 
         const imageItems = (Object.values(manifest) as any[])
@@ -882,7 +866,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
           let url: string | null = null;
 
-          // Strategy 1: archive.createUrl with resolved (zip-root) path
           try {
             const resolvedHref = book.path.resolve(item.href);
             if (book.archive && typeof book.archive.createUrl === "function") {
@@ -894,7 +877,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
             console.warn("[Photos] archive.createUrl failed for", item.href, e);
           }
 
-          // Strategy 2: book.load() resolves paths internally, returns a Blob
           if (!url) {
             try {
               const blob = await book.load(item.href);
@@ -928,97 +910,17 @@ export default function Reader({ bookData, onClose }: readerProps) {
     loadPhotos();
 
     return () => {
-      cancelled = true; // discard results if effect re-fires before async finishes
+      cancelled = true;
       photoBlobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
       photoBlobUrlsRef.current = [];
     };
   }, [showSidebar, sidebarTab, book]);
 
-  // define filtered highlights from highlightsList by using highlightsSearch
   const filteredHighlights = highlightsList.filter((hl) => {
     return hl.text.toLowerCase().includes(highlightsSearch.toLowerCase());
   });
 
-  // Render Highlights function
-  const renderHighlights = () => {
-    if (filteredHighlights.length === 0) {
-      // by default it won't be zero because "" just means get everything into filteredHighlights
-      return (
-        <p className="p-4 text-center text-gray-500">
-          {highlightsSearch
-            ? "No Matching Highlights found"
-            : "No Highlights Yet"}
-        </p>
-      );
-    }
-
-    return filteredHighlights.map((item, index) => {
-      return (
-        <button
-          key={item.cfi || index}
-          className="text-left w-full py-3 px-4 border-b"
-          onClick={async () => {
-            const hadInputFocus = overlayInputFocusedRef.current;
-            overlayCfiRef.current = null;
-            overlayInputFocusedRef.current = false;
-            setShowSidebar(false);
-            await displayCfi(item.cfi);
-            if (hadInputFocus) {
-              scheduleCfiRestore(item.cfi);
-            }
-          }}
-        >
-          {/* Chapter and Percentage Header */}
-          <div className="w-full flex justify-between items-start text-[10px] text-gray-400 uppercase tracking-widest font-semibold mb-1">
-            <span className="truncate pr-2">
-              {item.chapter || "Unknown Chapter"}
-            </span>
-            <span>
-              {item.percentage !== undefined ? `${item.percentage}%` : ""}
-            </span>
-          </div>
-
-          <p className="text-sm italic leading-relaxed">"{item.text}"</p>
-        </button>
-      );
-    });
-  };
-
-  // Render TOC function
-  const renderToc = (items: tocItem[], level = 0) => {
-    return items.map((item, index) => {
-      // Check if this item is the chapter the user is currently reading
-      const isActive = item.href === currentChapterHref;
-
-      return (
-        <div key={item.id || index}>
-          <button
-            id={isActive ? "active-toc-item" : undefined}
-            className={`w-full py-3 pr-4 border-b flex justify-between items-center transition-colors text-left ${isActive
-              ? "text-yellow-500 font-bold bg-white/5 border-white/20"
-              : "text-gray-200 hover:bg-white/5 border-white/5"
-              }`}
-            style={{ paddingLeft: `${level * 1.5 + 1}rem` }}
-            onClick={async () => {
-              overlayCfiRef.current = null;
-              overlayInputFocusedRef.current = false;
-              await rendition.display(item.href);
-              setShowSidebar(false);
-              setShowHeaderFooter(false);
-            }}
-          >
-            <span className="truncate pr-4">{item.label}</span>
-            {isActive && (
-              <span className="text-yellow-500 text-sm shrink-0">✓</span>
-            )}
-          </button>
-          {item.subitems &&
-            item.subitems.length > 0 &&
-            renderToc(item.subitems, level + 1)}
-        </div>
-      );
-    });
-  };
+  const isLight = theme === "light";
 
   const getCurrentCfi = (): string | null =>
     rendition?.currentLocation?.()?.start?.cfi ||
@@ -1027,8 +929,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
   const displayCfi = async (cfi: string) => {
     if (!rendition) return;
+    skipNextReadingTrackRef.current = true;
     await rendition.display(cfi);
-    await rendition.display(cfi); // double execution hack so scrolled flow lands on exact position
+    await rendition.display(cfi);
   };
 
   const scheduleCfiRestore = (cfi: string | null) => {
@@ -1061,25 +964,124 @@ export default function Reader({ bookData, onClose }: readerProps) {
     scheduleCfiRestore(cfi);
   };
 
-  // func for opening a Google search in a new tab
+  const renderHighlights = () => {
+    if (filteredHighlights.length === 0) {
+      return (
+        <p
+          className={`p-6 text-center text-xs ${
+            isLight ? "text-stone-500" : "text-zinc-500"
+          }`}
+        >
+          {highlightsSearch
+            ? "No matching highlights found"
+            : "No highlights yet"}
+        </p>
+      );
+    }
+
+    return (
+      <div className="p-2 space-y-1">
+        {filteredHighlights.map((item, index) => (
+          <button
+            key={item.cfi || index}
+            className={`text-left w-full p-3 rounded-xl border transition-colors cursor-pointer ${
+              isLight
+                ? "border-stone-900/[0.06] hover:bg-stone-900/[0.05] text-stone-800"
+                : "border-white/[0.06] hover:bg-white/[0.06] text-zinc-200"
+            }`}
+            onClick={async () => {
+              const hadInputFocus = overlayInputFocusedRef.current;
+              overlayCfiRef.current = null;
+              overlayInputFocusedRef.current = false;
+              setShowSidebar(false);
+              await displayCfi(item.cfi);
+              if (hadInputFocus) {
+                scheduleCfiRestore(item.cfi);
+              }
+            }}
+          >
+            <div
+              className={`w-full flex justify-between items-start text-[10px] uppercase tracking-widest font-semibold mb-1.5 ${
+                isLight ? "text-stone-500" : "text-zinc-400"
+              }`}
+            >
+              <span className="truncate pr-2">
+                {item.chapter || "Unknown Chapter"}
+              </span>
+              <span className="shrink-0">
+                {item.percentage !== undefined ? `${item.percentage}%` : ""}
+              </span>
+            </div>
+
+            <p className="text-xs sm:text-sm italic leading-relaxed">
+              "{item.text}"
+            </p>
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  const renderToc = (items: tocItem[], level = 0) => {
+    return items.map((item, index) => {
+      const isActive = item.href === currentChapterHref;
+
+      return (
+        <div key={item.id || index}>
+          <button
+            id={isActive ? "active-toc-item" : undefined}
+            className={`w-full py-2.5 pr-3 rounded-xl flex justify-between items-center transition-colors text-left text-xs sm:text-sm cursor-pointer ${
+              isActive
+                ? isLight
+                  ? "bg-amber-500/15 text-amber-800 font-semibold"
+                  : "bg-amber-500/15 text-amber-300 font-semibold"
+                : isLight
+                  ? "text-stone-700 hover:bg-stone-900/[0.05]"
+                  : "text-zinc-200 hover:bg-white/[0.06]"
+            }`}
+            style={{ paddingLeft: `${level * 1.1 + 0.75}rem` }}
+            onClick={async () => {
+              overlayCfiRef.current = null;
+              overlayInputFocusedRef.current = false;
+              skipNextReadingTrackRef.current = true;
+              await rendition.display(item.href);
+              setShowSidebar(false);
+              setShowHeaderFooter(false);
+            }}
+          >
+            <span className="truncate pr-3">{item.label}</span>
+            {isActive && (
+              <svg
+                className="w-3.5 h-3.5 shrink-0"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            )}
+          </button>
+          {item.subitems &&
+            item.subitems.length > 0 &&
+            renderToc(item.subitems, level + 1)}
+        </div>
+      );
+    });
+  };
+
   const handleDictionaryLookup = () => {
     if (!selectionText) return;
 
-    // selects the first word and removes the punctuation from it
     const word = selectionText
       .split(/\s+/)[0]
       .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "");
 
-    // create the google search url
     const searchUrl = `https://www.google.com/search?q=${encodeURIComponent("define " + word)}`;
-
-    // save current position before opening the tab
     lookupCfiRef.current = getCurrentCfi();
-
-    // open in a new tab securely
     window.open(searchUrl, "_blank", "noopener,noreferrer");
-
-    // close the selection menu
     closeContextUI();
   };
 
@@ -1104,10 +1106,10 @@ export default function Reader({ bookData, onClose }: readerProps) {
     };
   }, [rendition]);
 
-  // func for closing context ui gracefully
   const closeContextUI = () => {
-    // Clear selection if cancelled
-    pendingHighlight.current?.contents?.window?.getSelection()?.removeAllRanges();
+    pendingHighlight.current?.contents?.window
+      ?.getSelection()
+      ?.removeAllRanges();
 
     pendingHighlight.current = null;
     setSelectionText("");
@@ -1167,12 +1169,9 @@ export default function Reader({ bookData, onClose }: readerProps) {
     setContextCardCoords({ left, top });
   }, [contextCardAnchor, showHeaderFooter, selectionText, deleteMenu]);
 
-  // func for searching entire book
-  // Search the entire book (streams results as it goes)
   const executeSearch = async (query: string) => {
     if (!book || !query.trim()) return;
 
-    // Increment the search ID. This allows us to cancel this loop if the user types another letter.
     const currentSearchId = ++searchIdRef.current;
 
     setIsSearching(true);
@@ -1207,7 +1206,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
         await item.load(book.load.bind(book));
         const matches = item.find(query);
 
-        // 1. EXTRACT FULL PARAGRAPHS BEFORE UNLOADING
         const expandedMatches: { cfi: string; excerpt: string }[] = [];
 
         if (matches && matches.length > 0) {
@@ -1225,21 +1223,16 @@ export default function Reader({ bookData, onClose }: readerProps) {
             }
             let fullExcerpt = match.excerpt;
             try {
-              // Resolve the CFI to the actual HTML DOM Nodes inside the chapter
               const range = await book.getRange(match.cfi);
               if (range && range.startContainer) {
                 let node: any = range.startContainer;
-
-                // If we landed on a Text Node, move up to the actual HTML Element
                 if (node.nodeType === 3) node = node.parentNode;
 
-                // Traverse up the DOM tree to find the nearest paragraph or structural block
                 const block =
                   node.closest?.(
                     "p, div, section, li, h1, h2, h3, h4, h5, h6",
                   ) || node;
                 if (block && block.textContent) {
-                  // Remove weird line breaks/tabs and grab the whole paragraph!
                   fullExcerpt = block.textContent.replace(/\s+/g, " ").trim();
                 }
               }
@@ -1250,10 +1243,8 @@ export default function Reader({ bookData, onClose }: readerProps) {
           }
         }
 
-        // 2. SAFE TO UNLOAD CHAPTER FROM MEMORY NOW
         item.unload();
 
-        // 3. PROCESS THE RESULTS USING THE EXPANDED MATCHES
         if (expandedMatches.length > 0) {
           const searchToc = (
             items: tocItem[],
@@ -1270,7 +1261,7 @@ export default function Reader({ bookData, onClose }: readerProps) {
             return null;
           };
 
-          let chapterName = searchToc(toc, item.href) || "Unknown Chapter";
+          const chapterName = searchToc(toc, item.href) || "Unknown Chapter";
 
           for (const match of expandedMatches) {
             let percentage = 0;
@@ -1283,20 +1274,18 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
             results.push({
               cfi: match.cfi,
-              excerpt: match.excerpt, // This now contains the full sentence/paragraph!
+              excerpt: match.excerpt,
               chapter: chapterName.trim(),
               percentage,
             });
           }
 
-          // Stream results to UI
           if (currentSearchId === searchIdRef.current) {
             setSearchResults([...results]);
           }
         }
       }
 
-      // Mark as done when the loop completely finishes
       if (currentSearchId === searchIdRef.current) {
         setIsSearching(false);
       }
@@ -1306,14 +1295,12 @@ export default function Reader({ bookData, onClose }: readerProps) {
     }
   };
 
-  // Auto-trigger search when user types (with 500ms debounce)
   useEffect(() => {
     if (!showSearch) return;
 
     const queryChanged = prevSearchQueryRef.current !== searchQuery;
     prevSearchQueryRef.current = searchQuery;
 
-    // If the query is cleared, reset everything and kill active searches
     if (!searchQuery.trim()) {
       searchIdRef.current++;
       setSearchResults([]);
@@ -1321,7 +1308,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
       return;
     }
 
-    // Run immediately when toggling "Backwards only" or reopening search; debounce while typing
     if (!queryChanged) {
       executeSearch(searchQuery);
       return;
@@ -1334,10 +1320,6 @@ export default function Reader({ bookData, onClose }: readerProps) {
     return () => clearTimeout(delayFn);
   }, [searchQuery, backwardsOnly, showSearch]);
 
-  const isLight = theme === "light";
-
-  // WHAT THE READER ACTUALLY RENDERS:
-
   return (
     <>
       <div
@@ -1347,24 +1329,43 @@ export default function Reader({ bookData, onClose }: readerProps) {
         {/* TOP BAR */}
         {showHeaderFooter && (
           <div
-            className={`absolute top-0 left-0 w-full z-10 flex justify-between items-center p-3 shadow-md ${isLight
-              ? "bg-[#f4ecd8] text-[#2b2b2b] border-b border-black/10"
-              : "bg-[#1c1c1c] text-white"
-              }`}
+            className={`absolute top-0 left-0 w-full z-10 flex justify-between items-center px-3 py-2.5 border-b backdrop-blur-md shadow-sm ${
+              isLight
+                ? "bg-[#f4ecd8]/92 text-stone-800 border-stone-900/10"
+                : "bg-[#18181c]/92 text-zinc-100 border-white/[0.08]"
+            }`}
           >
-            <div className="flex">
-              <button
-                onClick={() => openOverlayWithCfi(setShowSidebar)}
-                className={`rounded py-2 px-3 ${isLight ? "hover:bg-black/5" : "hover:bg-white/5"
-                  }`}
+            <button
+              onClick={() => openOverlayWithCfi(setShowSidebar)}
+              className={`rounded-xl py-2 px-3 text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer ${
+                isLight
+                  ? "hover:bg-stone-900/[0.07] text-stone-800"
+                  : "hover:bg-white/[0.08] text-zinc-100"
+              }`}
+            >
+              <svg
+                className="w-4 h-4"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
               >
-                ☰ Menu
-              </button>
-            </div>
+                <line x1="4" y1="6" x2="20" y2="6" />
+                <line x1="4" y1="12" x2="20" y2="12" />
+                <line x1="4" y1="18" x2="20" y2="18" />
+              </svg>
+              <span>Menu</span>
+            </button>
 
             <button
               onClick={onClose}
-              className="bg-[#e24741] hover:bg-red-600 text-white rounded px-4 py-2 pointer transition-colors font-medium"
+              className={`rounded-xl px-3.5 py-2 text-xs sm:text-sm font-medium border transition-colors cursor-pointer ${
+                isLight
+                  ? "bg-rose-600/12 hover:bg-rose-600/20 text-rose-700 border-rose-600/20"
+                  : "bg-rose-500/16 hover:bg-rose-500/26 text-rose-300 border-rose-400/25"
+              }`}
             >
               Close
             </button>
@@ -1373,23 +1374,59 @@ export default function Reader({ bookData, onClose }: readerProps) {
 
         {/* SEARCH OVERLAY CARD */}
         {showSearch && (
-          <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-            <div className="bg-[#1c1c1c] w-full max-w-lg h-[80%] max-h-[700px] rounded-lg shadow-2xl border border-white/10 flex flex-col overflow-hidden">
+          <div
+            onClick={() => closeOverlayAndRestore(setShowSearch)}
+            className="absolute inset-0 z-30 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className={`w-full max-w-lg h-[80%] max-h-[700px] rounded-2xl shadow-2xl border flex flex-col overflow-hidden ${
+                isLight
+                  ? "bg-[#fdfaf3] border-stone-900/10 text-stone-800"
+                  : "bg-[#18181c] border-white/10 text-zinc-100"
+              }`}
+            >
               {/* Search Card Header */}
-              <div className="flex items-center justify-between p-4 border-b border-white/10 bg-black/20">
-                <h2 className="font-semibold text-white tracking-wide">
+              <div
+                className={`flex items-center justify-between px-4 py-3.5 border-b ${
+                  isLight ? "border-stone-900/[0.08]" : "border-white/[0.08]"
+                }`}
+              >
+                <h2 className="text-sm font-semibold tracking-tight">
                   Search Book
                 </h2>
                 <button
                   onClick={() => closeOverlayAndRestore(setShowSearch)}
-                  className="text-gray-400 hover:text-white px-2 rounded hover:bg-white/10 transition-colors"
+                  aria-label="Close search"
+                  className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                    isLight
+                      ? "text-stone-500 hover:bg-stone-900/[0.07] hover:text-stone-800"
+                      : "text-zinc-400 hover:bg-white/[0.08] hover:text-white"
+                  }`}
                 >
-                  ✕
+                  <svg
+                    className="w-4 h-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
                 </button>
               </div>
 
               {/* Search Input Area */}
-              <div className="p-4 border-b border-white/10 bg-white/5 flex flex-col gap-3">
+              <div
+                className={`p-4 border-b flex flex-col gap-3 ${
+                  isLight
+                    ? "border-stone-900/[0.08] bg-stone-900/[0.02]"
+                    : "border-white/[0.08] bg-white/[0.02]"
+                }`}
+              >
                 <input
                   type="text"
                   placeholder="Start typing to search..."
@@ -1398,7 +1435,11 @@ export default function Reader({ bookData, onClose }: readerProps) {
                     overlayInputFocusedRef.current = true;
                   }}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full bg-[#121212] border border-white/20 rounded-md px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors text-white placeholder-gray-500"
+                  className={`w-full rounded-xl px-3.5 py-2 text-sm border focus:outline-none transition-colors ${
+                    isLight
+                      ? "bg-white border-stone-900/10 text-stone-800 placeholder-stone-400 focus:border-blue-600/50"
+                      : "bg-white/[0.05] border-white/10 text-zinc-100 placeholder-zinc-500 focus:border-blue-400/50"
+                  }`}
                 />
 
                 <button
@@ -1408,23 +1449,35 @@ export default function Reader({ bookData, onClose }: readerProps) {
                   onClick={() => setBackwardsOnly((prev) => !prev)}
                   className="w-full flex items-center justify-between cursor-pointer select-none"
                 >
-                  <span className="text-xs text-gray-300 font-medium">
+                  <span
+                    className={`text-xs font-medium ${
+                      isLight ? "text-stone-600" : "text-zinc-300"
+                    }`}
+                  >
                     Backwards only
                   </span>
                   <span
-                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${backwardsOnly ? "bg-blue-600" : "bg-white/20"
-                      }`}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      backwardsOnly
+                        ? isLight
+                          ? "bg-blue-600"
+                          : "bg-blue-500"
+                        : isLight
+                          ? "bg-stone-900/15"
+                          : "bg-white/20"
+                    }`}
                   >
                     <span
-                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${backwardsOnly ? "translate-x-5" : "translate-x-0.5"
-                        }`}
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        backwardsOnly ? "translate-x-5" : "translate-x-0.5"
+                      }`}
                     />
                   </span>
                 </button>
               </div>
 
               {/* Search Results Area */}
-              <div className="flex-1 overflow-y-auto p-2 bg-[#1c1c1c]">
+              <div className="flex-1 overflow-y-auto p-2">
                 {searchResults.length > 0 ? (
                   <div className="space-y-1">
                     {searchResults.map((res, i) => (
@@ -1440,53 +1493,88 @@ export default function Reader({ bookData, onClose }: readerProps) {
                             scheduleCfiRestore(res.cfi);
                           }
                         }}
-                        className="w-full text-left p-4 hover:bg-white/5 rounded-lg border-b border-white/5 transition-colors focus:bg-white/10 focus:outline-none"
+                        className={`w-full text-left p-3.5 rounded-xl border transition-colors cursor-pointer ${
+                          isLight
+                            ? "border-stone-900/[0.06] hover:bg-stone-900/[0.04]"
+                            : "border-white/[0.06] hover:bg-white/[0.05]"
+                        }`}
                       >
-                        <div className="flex justify-between items-start text-[10px] text-gray-400 uppercase tracking-widest font-semibold mb-2">
+                        <div
+                          className={`flex justify-between items-start text-[10px] uppercase tracking-widest font-semibold mb-1.5 ${
+                            isLight ? "text-stone-500" : "text-zinc-400"
+                          }`}
+                        >
                           <span className="truncate pr-2">{res.chapter}</span>
                           <span className="shrink-0">{res.percentage}%</span>
                         </div>
 
-                        <p className="text-sm text-gray-300 italic leading-relaxed">
+                        <p
+                          className={`text-xs sm:text-sm italic leading-relaxed ${
+                            isLight ? "text-stone-700" : "text-zinc-300"
+                          }`}
+                        >
                           {safeRegex
                             ? (res.excerpt || "")
-                              .split(safeRegex)
-                              .map((part, index) =>
-                                part.toLowerCase() ===
+                                .split(safeRegex)
+                                .map((part, index) =>
+                                  part.toLowerCase() ===
                                   highlightQuery.toLowerCase() ? (
-                                  <mark
-                                    key={index}
-                                    className="bg-yellow-500/40 text-white rounded px-1"
-                                  >
-                                    {part}
-                                  </mark>
-                                ) : (
-                                  part
-                                ),
-                              )
+                                    <mark
+                                      key={index}
+                                      className={`rounded px-1 ${
+                                        isLight
+                                          ? "bg-amber-400/40 text-stone-900"
+                                          : "bg-amber-400/30 text-amber-100"
+                                      }`}
+                                    >
+                                      {part}
+                                    </mark>
+                                  ) : (
+                                    part
+                                  ),
+                                )
                             : res.excerpt}
                         </p>
                       </button>
                     ))}
 
-                    {/* Show a mini loading indicator at the bottom if it's still scanning remaining chapters */}
                     {isSearching && (
-                      <div className="text-center text-gray-500 py-4 text-xs uppercase tracking-widest animate-pulse font-semibold">
+                      <div
+                        className={`text-center py-4 text-[10px] uppercase tracking-widest animate-pulse font-semibold ${
+                          isLight ? "text-stone-500" : "text-zinc-500"
+                        }`}
+                      >
                         Scanning remaining chapters...
                       </div>
                     )}
                   </div>
                 ) : isSearching ? (
-                  <div className="flex flex-col items-center justify-center h-full text-gray-400">
-                    <div className="animate-spin text-2xl mb-4">⏳</div>
-                    <p className="text-sm">Scanning entire book...</p>
+                  <div
+                    className={`flex flex-col items-center justify-center h-full gap-3 ${
+                      isLight ? "text-stone-500" : "text-zinc-400"
+                    }`}
+                  >
+                    <span
+                      className={`w-6 h-6 rounded-full border-2 border-t-transparent animate-spin ${
+                        isLight ? "border-blue-600" : "border-blue-400"
+                      }`}
+                    />
+                    <p className="text-xs sm:text-sm">Scanning entire book...</p>
                   </div>
                 ) : searchQuery ? (
-                  <p className="text-center text-gray-500 mt-10 text-sm">
+                  <p
+                    className={`text-center mt-10 text-xs sm:text-sm ${
+                      isLight ? "text-stone-500" : "text-zinc-500"
+                    }`}
+                  >
                     No results found for "{searchQuery}".
                   </p>
                 ) : (
-                  <p className="text-center text-gray-500 mt-10 text-sm">
+                  <p
+                    className={`text-center mt-10 text-xs sm:text-sm ${
+                      isLight ? "text-stone-500" : "text-zinc-500"
+                    }`}
+                  >
                     Type a keyword to begin searching.
                   </p>
                 )}
@@ -1495,50 +1583,106 @@ export default function Reader({ bookData, onClose }: readerProps) {
           </div>
         )}
 
-        {/* SIDEBAR OVERLAY */}
+        {/* FLOATING MINIMALIST SIDEBAR (50% width, rounded corners, inset from all edges) */}
         {showSidebar && (
-          <div className="absolute inset-0 z-20 flex">
-            <div className="w-4/5 max-w-sm h-full bg-[#1c1c1c] flex flex-col">
-              <div className="flex border-b text-center">
-                <button
-                  className={`flex-1 py-4 font-semibold ${sidebarTab === "toc" ? "border-b-4" : "text-gray-500"}`}
-                  onClick={() => setSidebarTab("toc")}
+          <div
+            onClick={() => closeOverlayAndRestore(setShowSidebar)}
+            className="fixed inset-0 z-20 bg-black/45 backdrop-blur-sm p-3 sm:p-5 flex items-stretch justify-start"
+          >
+            <aside
+              onClick={(e) => e.stopPropagation()}
+              className={`w-1/2 min-w-[80%] h-full rounded-2xl border shadow-2xl flex flex-col overflow-hidden ${
+                isLight
+                  ? "bg-[#fdfaf3]/95 border-stone-900/10 text-stone-800"
+                  : "bg-[#18181c]/95 border-white/10 text-zinc-100"
+              }`}
+            >
+              {/* Segmented Tabs Header */}
+              <div
+                className={`p-2.5 border-b ${
+                  isLight ? "border-stone-900/[0.08]" : "border-white/[0.08]"
+                }`}
+              >
+                <div
+                  className={`p-1 rounded-xl grid grid-cols-3 gap-1 ${
+                    isLight ? "bg-stone-900/[0.05]" : "bg-white/[0.05]"
+                  }`}
                 >
-                  Chapters
-                </button>
-                <button
-                  className={`flex-1 py-4 font-semibold ${sidebarTab === "highlights" ? "border-b-4" : "text-gray-500"}`}
-                  onClick={() => setSidebarTab("highlights")}
-                >
-                  Highlights
-                </button>
-                <button
-                  className={`flex-1 py-4 font-semibold ${sidebarTab === "photos" ? "border-b-4" : "text-gray-500"}`}
-                  onClick={() => setSidebarTab("photos")}
-                >
-                  Photos
-                </button>
+                  <button
+                    className={`py-1.5 px-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-colors cursor-pointer truncate ${
+                      sidebarTab === "toc"
+                        ? isLight
+                          ? "bg-white text-stone-900 shadow-sm"
+                          : "bg-white/15 text-white shadow-sm"
+                        : isLight
+                          ? "text-stone-500 hover:text-stone-800"
+                          : "text-zinc-400 hover:text-zinc-200"
+                    }`}
+                    onClick={() => setSidebarTab("toc")}
+                  >
+                    Chapters
+                  </button>
+                  <button
+                    className={`py-1.5 px-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-colors cursor-pointer truncate ${
+                      sidebarTab === "highlights"
+                        ? isLight
+                          ? "bg-white text-stone-900 shadow-sm"
+                          : "bg-white/15 text-white shadow-sm"
+                        : isLight
+                          ? "text-stone-500 hover:text-stone-800"
+                          : "text-zinc-400 hover:text-zinc-200"
+                    }`}
+                    onClick={() => setSidebarTab("highlights")}
+                  >
+                    Highlights
+                  </button>
+                  <button
+                    className={`py-1.5 px-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-colors cursor-pointer truncate ${
+                      sidebarTab === "photos"
+                        ? isLight
+                          ? "bg-white text-stone-900 shadow-sm"
+                          : "bg-white/15 text-white shadow-sm"
+                        : isLight
+                          ? "text-stone-500 hover:text-stone-800"
+                          : "text-zinc-400 hover:text-zinc-200"
+                    }`}
+                    onClick={() => setSidebarTab("photos")}
+                  >
+                    Photos
+                  </button>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto">
                 {sidebarTab === "toc" && (
-                  <div className="flex flex-col">
+                  <div className="p-2 flex flex-col gap-0.5">
                     {toc.length > 0 ? (
                       renderToc(toc)
                     ) : (
-                      <p className="p-4">No Table of Contents found.</p>
+                      <p
+                        className={`p-4 text-center text-xs ${
+                          isLight ? "text-stone-500" : "text-zinc-500"
+                        }`}
+                      >
+                        No Table of Contents found.
+                      </p>
                     )}
                   </div>
                 )}
+
                 {sidebarTab === "highlights" && (
                   <div className="flex flex-col h-full overflow-hidden">
-                    {/* Scrollable Area */}
                     <div className="flex-1 overflow-y-auto">
                       {renderHighlights()}
                     </div>
 
-                    {/* Search Bar at the bottom */}
-                    <div className="p-3 border-t border-white/10 bg-[#1c1c1c]">
+                    <div
+                      className={`p-2.5 border-t ${
+                        isLight
+                          ? "border-stone-900/[0.08]"
+                          : "border-white/[0.08]"
+                      }`}
+                    >
                       <div className="relative">
                         <input
                           type="text"
@@ -1548,52 +1692,94 @@ export default function Reader({ bookData, onClose }: readerProps) {
                             overlayInputFocusedRef.current = true;
                           }}
                           onChange={(e) => setHighlightsSearch(e.target.value)}
-                          className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors"
+                          className={`w-full rounded-xl px-3.5 py-2 pr-8 text-xs sm:text-sm border focus:outline-none transition-colors ${
+                            isLight
+                              ? "bg-white border-stone-900/10 text-stone-800 placeholder-stone-400 focus:border-blue-600/50"
+                              : "bg-white/[0.05] border-white/10 text-zinc-100 placeholder-zinc-500 focus:border-blue-400/50"
+                          }`}
                         />
                         {highlightsSearch && (
                           <button
                             onClick={() => setHighlightsSearch("")}
-                            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
+                            aria-label="Clear highlights search"
+                            className={`absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded cursor-pointer ${
+                              isLight
+                                ? "text-stone-400 hover:text-stone-700"
+                                : "text-zinc-400 hover:text-white"
+                            }`}
                           >
-                            ✕
+                            <svg
+                              className="w-3.5 h-3.5"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <line x1="18" y1="6" x2="6" y2="18" />
+                              <line x1="6" y1="6" x2="18" y2="18" />
+                            </svg>
                           </button>
                         )}
                       </div>
                     </div>
                   </div>
                 )}
+
                 {sidebarTab === "photos" && (
                   <>
                     {photosLoading ? (
-                      <div className="flex items-center justify-center h-40 text-gray-500 text-sm">
+                      <div
+                        className={`flex items-center justify-center h-40 text-xs ${
+                          isLight ? "text-stone-500" : "text-zinc-500"
+                        }`}
+                      >
                         Loading images...
                       </div>
                     ) : photosList.length === 0 ? (
-                      <p className="p-4 text-center text-gray-500 text-sm">
+                      <p
+                        className={`p-4 text-center text-xs ${
+                          isLight ? "text-stone-500" : "text-zinc-500"
+                        }`}
+                      >
                         No images found in this book.
                       </p>
                     ) : (
                       <>
-                        <p className="text-[10px] text-white/30 uppercase tracking-widest font-semibold text-center py-2 border-b border-white/10">
+                        <p
+                          className={`text-[10px] uppercase tracking-widest font-semibold text-center py-2 border-b ${
+                            isLight
+                              ? "text-stone-400 border-stone-900/[0.08]"
+                              : "text-zinc-500 border-white/[0.08]"
+                          }`}
+                        >
                           {photosList.length} image
                           {photosList.length !== 1 ? "s" : ""}
                         </p>
-                        <div className="grid grid-cols gap-2 p-3">
+                        <div className="grid grid-cols-2 gap-2.5 p-3">
                           {photosList.map((url, index) => (
                             <button
                               key={index}
                               onClick={() => {
                                 lookupCfiRef.current = getCurrentCfi();
-                                window.open(url, "_blank", "noopener,noreferrer");
+                                window.open(
+                                  url,
+                                  "_blank",
+                                  "noopener,noreferrer",
+                                );
                               }}
-                              className="aspect-square rounded overflow-hidden bg-white/5 hover:ring-2 hover:ring-blue-500 transition-all"
+                              className={`aspect-square rounded-xl overflow-hidden border transition-all cursor-pointer ${
+                                isLight
+                                  ? "bg-stone-900/[0.04] border-stone-900/10 hover:ring-2 hover:ring-blue-600/50"
+                                  : "bg-white/[0.05] border-white/10 hover:ring-2 hover:ring-blue-400/50"
+                              }`}
                             >
                               <img
                                 src={url}
                                 alt={`Book image ${index + 1}`}
                                 className="w-full h-full object-cover"
                                 onError={(e) => {
-                                  // Hide the button if the image breaks
                                   const btn = (
                                     e.target as HTMLImageElement
                                   ).closest("button");
@@ -1608,21 +1794,16 @@ export default function Reader({ bookData, onClose }: readerProps) {
                   </>
                 )}
               </div>
-            </div>
-
-            <div
-              className="flex-1 bg-black/50"
-              onClick={() => closeOverlayAndRestore(setShowSidebar)}
-            ></div>
+            </aside>
           </div>
         )}
 
         {/* THE VIEWER */}
         <div
           ref={viewerRef}
-          // className="flex-1 overflow-hidden relative z-0"
-          className={`flex-1 overflow-hidden relative z-0 [&_.epub-container]:overflow-x-hidden [&_.epub-container]:[scrollbar-width:none] [&_.epub-container::-webkit-scrollbar]:hidden ${theme === "light" ? "bg-[#fbf5e6]" : "bg-[#1c1c1c]"
-            }`}
+          className={`flex-1 overflow-hidden relative z-0 [&_.epub-container]:overflow-x-hidden [&_.epub-container]:[scrollbar-width:none] [&_.epub-container::-webkit-scrollbar]:hidden ${
+            isLight ? "bg-[#fbf5e6]" : "bg-[#1c1c1c]"
+          }`}
         ></div>
 
         {/* FLOATING CONTEXT CARD FOR SELECTED TEXT / CLICKED HIGHLIGHT */}
@@ -1637,18 +1818,37 @@ export default function Reader({ bookData, onClose }: readerProps) {
                 top: contextCardCoords ? `${contextCardCoords.top}px` : "0px",
                 visibility: contextCardCoords ? "visible" : "hidden",
               }}
-              className={`absolute z-[15] rounded-xl p-1.5 flex items-center gap-1 shadow-2xl border whitespace-nowrap ${isLight
-                ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
-                : "bg-[#242424] text-white border-white/15"
-                }`}
+              className={`absolute z-[15] rounded-2xl p-1.5 flex items-center gap-1.5 shadow-2xl border backdrop-blur-xl whitespace-nowrap ${
+                isLight
+                  ? "bg-[#fdfaf3]/95 text-stone-800 border-stone-900/10"
+                  : "bg-[#1e1e24]/95 text-zinc-100 border-white/10"
+              }`}
             >
               {deleteMenu ? (
                 <>
                   <button
                     onClick={() => handleRemoveHighlight(deleteMenu.cfi)}
-                    className="bg-[#e24741] hover:bg-red-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                    className={`px-3 py-1.5 rounded-xl text-xs font-medium border flex items-center gap-1.5 transition-colors cursor-pointer ${
+                      isLight
+                        ? "bg-rose-600/12 hover:bg-rose-600/20 text-rose-700 border-rose-600/20"
+                        : "bg-rose-500/18 hover:bg-rose-500/28 text-rose-300 border-rose-400/25"
+                    }`}
                   >
-                    Delete Highlight
+                    <svg
+                      className="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <polyline points="3 6 5 6 21 6" />
+                      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                      <path d="M10 11v6" />
+                      <path d="M14 11v6" />
+                    </svg>
+                    <span>Delete Highlight</span>
                   </button>
                   <button
                     onClick={() => {
@@ -1656,42 +1856,118 @@ export default function Reader({ bookData, onClose }: readerProps) {
                       setContextCardAnchor(null);
                     }}
                     aria-label="Close context card"
-                    className={`px-2 py-1.5 rounded-lg text-xs transition-colors ${isLight ? "hover:bg-black/10 text-black/60" : "hover:bg-white/10 text-white/60"
-                      }`}
+                    className={`p-1.5 rounded-xl text-xs transition-colors cursor-pointer ${
+                      isLight
+                        ? "hover:bg-stone-900/[0.08] text-stone-500"
+                        : "hover:bg-white/[0.1] text-zinc-400"
+                    }`}
                   >
-                    ✕
+                    <svg
+                      className="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
                   </button>
                 </>
               ) : (
                 <>
                   <button
                     onClick={handleDictionaryLookup}
-                    className="bg-blue-700 hover:bg-blue-600 text-white px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                    className={`px-2.5 py-1.5 rounded-xl text-xs font-medium border flex items-center gap-1.5 transition-colors cursor-pointer ${
+                      isLight
+                        ? "bg-stone-900/[0.06] hover:bg-stone-900/[0.12] text-stone-800 border-stone-900/10"
+                        : "bg-white/[0.08] hover:bg-white/[0.14] text-zinc-100 border-white/10"
+                    }`}
                   >
-                    <span>🌐</span>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="12" cy="12" r="9" />
+                      <line x1="3.6" y1="9" x2="20.4" y2="9" />
+                      <line x1="3.6" y1="15" x2="20.4" y2="15" />
+                      <path d="M12 3a14.5 14.5 0 0 0 0 18" />
+                      <path d="M12 3a14.5 14.5 0 0 1 0 18" />
+                    </svg>
                     <span>Define</span>
                   </button>
                   <button
                     onClick={handleSearchSelection}
-                    className="bg-blue-800 hover:bg-blue-700 text-white px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                    className={`px-2.5 py-1.5 rounded-xl text-xs font-medium border flex items-center gap-1.5 transition-colors cursor-pointer ${
+                      isLight
+                        ? "bg-blue-600/12 hover:bg-blue-600/20 text-blue-700 border-blue-600/20"
+                        : "bg-blue-500/18 hover:bg-blue-500/28 text-blue-300 border-blue-400/25"
+                    }`}
                   >
-                    <span>🔎</span>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="11" cy="11" r="7" />
+                      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    </svg>
                     <span>Search</span>
                   </button>
                   <button
                     onClick={handleFinalizePendingHighlight}
-                    className="bg-yellow-700 hover:bg-yellow-600 text-white px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 transition-colors"
+                    className={`px-2.5 py-1.5 rounded-xl text-xs font-medium border flex items-center gap-1.5 transition-colors cursor-pointer ${
+                      isLight
+                        ? "bg-amber-500/15 hover:bg-amber-500/25 text-amber-800 border-amber-600/25"
+                        : "bg-amber-500/18 hover:bg-amber-500/28 text-amber-300 border-amber-400/25"
+                    }`}
                   >
-                    <span>✏️</span>
+                    <svg
+                      className="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M12 20h9" />
+                      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                    </svg>
                     <span>Highlight</span>
                   </button>
                   <button
                     onClick={closeContextUI}
                     aria-label="Cancel selection"
-                    className={`px-2 py-1.5 rounded-lg text-xs transition-colors ${isLight ? "hover:bg-black/10 text-black/60" : "hover:bg-white/10 text-white/60"
-                      }`}
+                    className={`p-1.5 rounded-xl text-xs transition-colors cursor-pointer ${
+                      isLight
+                        ? "hover:bg-stone-900/[0.08] text-stone-500"
+                        : "hover:bg-white/[0.1] text-zinc-400"
+                    }`}
                   >
-                    ✕
+                    <svg
+                      className="w-3.5 h-3.5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
                   </button>
                 </>
               )}
@@ -1701,10 +1977,11 @@ export default function Reader({ bookData, onClose }: readerProps) {
         {/* PERSISTENT FOOTER */}
         {!showHeaderFooter && !showSidebar && (
           <div
-            className={`h-6 w-full shrink-0 flex items-center justify-between px-4 text-[10px] uppercase tracking-widest font-semibold relative z-10 ${isLight
-              ? "bg-[#fbf5e6] text-black/45"
-              : "bg-[#1c1c1c] text-white/40"
-              }`}
+            className={`h-6 w-full shrink-0 flex items-center justify-between px-4 text-[10px] uppercase tracking-widest font-semibold relative z-10 ${
+              isLight
+                ? "bg-[#fbf5e6] text-stone-500"
+                : "bg-[#1c1c1c] text-zinc-500"
+            }`}
           >
             <div className="flex-1">{pageInfo}</div>
             <div className="flex-1 text-center truncate px-2">
@@ -1714,31 +1991,35 @@ export default function Reader({ bookData, onClose }: readerProps) {
           </div>
         )}
 
-        {/* FOOTER */}
+        {/* FOOTER CONTROLS */}
         {showHeaderFooter && (
           <div
-            className={`p-1 flex items-center justify-between border-t relative z-10 ${isLight
-              ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
-              : "bg-[#1c1c1c] text-white border-white/15"
-              }`}
+            className={`px-3 py-2 flex items-center justify-between border-t backdrop-blur-md relative z-10 ${
+              isLight
+                ? "bg-[#f4ecd8]/92 text-stone-800 border-stone-900/10"
+                : "bg-[#18181c]/92 text-zinc-100 border-white/[0.08]"
+            }`}
           >
+            {/* Left Side: Typography & Reader Theme */}
             <div className="relative w-1/3">
               <button
                 onClick={() => setShowFontMenu(!showFontMenu)}
-                className={`rounded font-bold py-2 px-3 flex items-center justify-center transition-colors ${isLight
-                  ? "bg-black/5 hover:bg-black/10"
-                  : "bg-white/10 hover:bg-white/20"
-                  }`}
+                className={`rounded-xl font-semibold text-sm py-2 px-3 flex items-center justify-center border transition-colors cursor-pointer ${
+                  isLight
+                    ? "bg-stone-900/[0.05] hover:bg-stone-900/[0.1] border-stone-900/10 text-stone-800"
+                    : "bg-white/[0.07] hover:bg-white/[0.14] border-white/10 text-zinc-100"
+                }`}
               >
                 Aa
               </button>
 
               {showFontMenu && (
                 <div
-                  className={`absolute bottom-full left-0 mb-3 p-2.5 rounded-lg shadow-xl border flex flex-col gap-2 min-w-[140px] ${isLight
-                    ? "bg-[#f4ecd8] text-[#2b2b2b] border-black/15"
-                    : "bg-[#1c1c1c] text-white border-white/15"
-                    }`}
+                  className={`absolute bottom-full left-0 mb-3 p-3 rounded-2xl shadow-2xl border backdrop-blur-xl flex flex-col gap-2.5 min-w-[160px] ${
+                    isLight
+                      ? "bg-[#fdfaf3]/95 text-stone-800 border-stone-900/10"
+                      : "bg-[#18181c]/95 text-zinc-100 border-white/10"
+                  }`}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <button
@@ -1746,14 +2027,15 @@ export default function Reader({ bookData, onClose }: readerProps) {
                         setFontSize((f) => Math.max(50, f - 10));
                         touchSettingsMeta("fontSize");
                       }}
-                      className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
-                        ? "bg-black/5 hover:bg-black/10"
-                        : "bg-white/10 hover:bg-white/20"
-                        }`}
+                      className={`w-8 h-8 rounded-xl font-semibold text-lg flex items-center justify-center border transition-colors cursor-pointer ${
+                        isLight
+                          ? "bg-stone-900/[0.05] hover:bg-stone-900/[0.1] border-stone-900/10"
+                          : "bg-white/[0.07] hover:bg-white/[0.14] border-white/10"
+                      }`}
                     >
-                      -
+                      −
                     </button>
-                    <span className="w-12 text-center text-sm font-medium">
+                    <span className="w-12 text-center text-xs font-semibold">
                       {fontSize}%
                     </span>
                     <button
@@ -1761,26 +2043,29 @@ export default function Reader({ bookData, onClose }: readerProps) {
                         setFontSize((f) => Math.min(300, f + 10));
                         touchSettingsMeta("fontSize");
                       }}
-                      className={`w-8 h-8 rounded font-bold text-xl flex items-center justify-center transition-colors ${isLight
-                        ? "bg-black/5 hover:bg-black/10"
-                        : "bg-white/10 hover:bg-white/20"
-                        }`}
+                      className={`w-8 h-8 rounded-xl font-semibold text-lg flex items-center justify-center border transition-colors cursor-pointer ${
+                        isLight
+                          ? "bg-stone-900/[0.05] hover:bg-stone-900/[0.1] border-stone-900/10"
+                          : "bg-white/[0.07] hover:bg-white/[0.14] border-white/10"
+                      }`}
                     >
                       +
                     </button>
                   </div>
 
                   <div
-                    className={`border-t ${isLight ? "border-black/10" : "border-white/10"
-                      }`}
+                    className={`border-t ${
+                      isLight ? "border-stone-900/10" : "border-white/10"
+                    }`}
                   />
 
                   <button
                     onClick={toggleTheme}
-                    className={`w-full py-1.5 px-3 rounded text-sm font-medium transition-colors whitespace-nowrap ${isLight
-                      ? "bg-black/5 hover:bg-black/10"
-                      : "bg-white/10 hover:bg-white/20"
-                      }`}
+                    className={`w-full py-2 px-3 rounded-xl text-xs font-medium border transition-colors whitespace-nowrap cursor-pointer ${
+                      isLight
+                        ? "bg-stone-900/[0.05] hover:bg-stone-900/[0.1] border-stone-900/10"
+                        : "bg-white/[0.07] hover:bg-white/[0.14] border-white/10"
+                    }`}
                   >
                     {theme === "dark" ? "Light mode" : "Dark mode"}
                   </button>
@@ -1789,42 +2074,83 @@ export default function Reader({ bookData, onClose }: readerProps) {
             </div>
 
             {/* Center Side: Navigation and Page Info */}
-            <div className="flex items-center gap-6">
+            <div className="flex items-center gap-3 sm:gap-5">
               <button
                 onClick={() => rendition?.prev()}
-                className={`flex items-center justify-center rounded px-3 py-1 ${isLight
-                  ? "bg-black/10 active:bg-black/25"
-                  : "bg-white/20 active:bg-white/70"
-                  }`}
+                aria-label="Previous page"
+                className={`flex items-center justify-center rounded-xl p-2 border transition-colors cursor-pointer ${
+                  isLight
+                    ? "bg-stone-900/[0.05] hover:bg-stone-900/[0.1] active:bg-stone-900/20 border-stone-900/10"
+                    : "bg-white/[0.07] hover:bg-white/[0.14] active:bg-white/25 border-white/10"
+                }`}
               >
-                ‹
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="15 18 9 12 15 6" />
+                </svg>
               </button>
 
               <div
-                className={`text-center text-[11px] flex uppercase whitespace-nowrap font-medium ${isLight ? "text-black/60" : "text-gray-400"
-                  }`}
+                className={`text-center text-[11px] uppercase whitespace-nowrap font-semibold tracking-wider ${
+                  isLight ? "text-stone-600" : "text-zinc-400"
+                }`}
               >
                 {pageInfo}
               </div>
 
               <button
                 onClick={() => rendition?.next()}
-                className={`flex items-center justify-center rounded px-3 py-1 ${isLight
-                  ? "bg-black/10 active:bg-black/25"
-                  : "bg-white/20 active:bg-white/70"
-                  }`}
+                aria-label="Next page"
+                className={`flex items-center justify-center rounded-xl p-2 border transition-colors cursor-pointer ${
+                  isLight
+                    ? "bg-stone-900/[0.05] hover:bg-stone-900/[0.1] active:bg-stone-900/20 border-stone-900/10"
+                    : "bg-white/[0.07] hover:bg-white/[0.14] active:bg-white/25 border-white/10"
+                }`}
               >
-                ›
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
               </button>
             </div>
 
-            {/* Right Side */}
+            {/* Right Side: Search */}
             <div className="w-1/3 flex justify-end">
               <button
                 onClick={handleSearchSelection}
-                className="rounded py-2 px-3 bg-blue-800 text-white"
+                aria-label="Search book"
+                className={`rounded-xl p-2.5 border transition-colors cursor-pointer ${
+                  isLight
+                    ? "bg-blue-600/12 hover:bg-blue-600/20 text-blue-700 border-blue-600/20"
+                    : "bg-blue-500/18 hover:bg-blue-500/28 text-blue-300 border-blue-400/25"
+                }`}
               >
-                🔎
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="11" cy="11" r="7" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
               </button>
             </div>
           </div>

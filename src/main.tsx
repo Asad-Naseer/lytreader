@@ -3,11 +3,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import 'tachyons/css/tachyons.min.css'
-
-
 import { registerSW } from 'virtual:pwa-register'
-import ReactDOM from 'react-dom/client'
-import React from 'react'
 
 // Register the Service Worker
 const updateSW = registerSW({
@@ -21,12 +17,6 @@ const updateSW = registerSW({
     console.log("App is ready to work offline!");
   },
 })
-
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
